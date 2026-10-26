@@ -25,8 +25,16 @@ export type ApiErrorCode =
     | "FORBIDDEN"
     | "NOT_FOUND"
     | "VALIDATION_FAILED"
+    /** T02：画布 doc 超过 `MAX_DOC_JSON_MB`（8MB）。 */
+    | "DOC_TOO_LARGE"
+    /** T02：`Range` 不可满足（416）。 */
+    | "RANGE_NOT_SATISFIABLE"
     | "REVISION_CONFLICT"
     | "IDEMPOTENCY_DUPLICATE"
+    /** T02：`/api/setup` 在 users 表非空时被调用。 */
+    | "ALREADY_INITIALIZED"
+    /** T02：系统未初始化，需先走 `/api/setup`。 */
+    | "SETUP_REQUIRED"
     | "PROVIDER_KEY_MISSING"
     | "PROVIDER_UPSTREAM_ERROR"
     | "PROVIDER_CONTENT_REJECTED"

@@ -12,8 +12,16 @@ export const ERROR_CODES = {
     FORBIDDEN: 403,
     NOT_FOUND: 404,
     VALIDATION_FAILED: 400,
+    /** T02：画布 doc 超过 `MAX_DOC_JSON_MB`（默认 8MB）。 */
+    DOC_TOO_LARGE: 413,
+    /** T02：`Range` 请求头不可满足（RFC 7233）。 */
+    RANGE_NOT_SATISFIABLE: 416,
     REVISION_CONFLICT: 409,
     IDEMPOTENCY_DUPLICATE: 409,
+    /** T02：`/api/setup` 在 users 表非空时被调用。 */
+    ALREADY_INITIALIZED: 409,
+    /** T02：系统尚未初始化（users 表为空），需先走 `/api/setup`。 */
+    SETUP_REQUIRED: 403,
     PROVIDER_KEY_MISSING: 400,
     PROVIDER_UPSTREAM_ERROR: 502,
     PROVIDER_CONTENT_REJECTED: 422,
@@ -40,8 +48,12 @@ const DEFAULT_MESSAGES: Record<ErrorCode, string> = {
     FORBIDDEN: "无权限操作该资源",
     NOT_FOUND: "资源不存在",
     VALIDATION_FAILED: "参数不合法",
+    DOC_TOO_LARGE: "画布内容过大",
+    RANGE_NOT_SATISFIABLE: "请求的字节范围不可满足",
     REVISION_CONFLICT: "另一端已更新画布",
     IDEMPOTENCY_DUPLICATE: "重复提交",
+    ALREADY_INITIALIZED: "系统已完成初始化",
+    SETUP_REQUIRED: "系统尚未初始化，请先创建管理员账号",
     PROVIDER_KEY_MISSING: "该渠道尚未配置密钥",
     PROVIDER_UPSTREAM_ERROR: "上游服务返回错误",
     PROVIDER_CONTENT_REJECTED: "内容被上游审核拒绝",

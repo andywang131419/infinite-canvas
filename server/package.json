@@ -12,7 +12,9 @@
         "dev": "bun --watch src/index.ts",
         "start": "bun run src/index.ts",
         "test": "bun test",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "user:create": "bun run scripts/create-user.ts",
+        "verify:t02": "node scripts/verify-t02.mjs"
     },
     "dependencies": {
         "hono": "^4.6.14",

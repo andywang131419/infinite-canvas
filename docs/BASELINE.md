@@ -134,3 +134,81 @@ docs/       本项目文档（BASE-SURVEY.md / BASELINE.md / ARCH 副本）
 |---|---|
 | 2026-10-25 | 完成只读基座探查，产出 `docs/BASE-SURVEY.md` |
 | 2026-10-25 | T01：创建 `server/` 与 `deploy/` 骨架，打通部署链路；建立 `stable` 分支 |
+| 2026-10-25 | T02：数据层仓储 + argon2id/不透明 token 鉴权 + doc 清洗 + 资产内容寻址存储 + 画布 CRUD 乐观锁 |
+
+---
+
+## 6. 待办：`server/bun.lock`（**必须由有 Bun 的环境生成**）
+
+**现状（T02 结束时仍未解决）**：`server/` 下**没有** `bun.lock`。
+
+原因：当前开发机只有 Node 22（`node -v` → v22.22.2）、npm、git，**没有 Bun**，
+也没有 Docker。因此 `bun install` 无法执行。
+
+`server/Dockerfile` 当前写的是：
+
+```dockerfile
+RUN bun install --production
+```
+
+并且**故意保留** `--frozen-lockfile` 的 TODO 注释以及"先不要切 frozen"的提示。
+这不是遗忘，而是刻意的：在没有 lock 文件的情况下加 `--frozen-lockfile` 会让镜像构建
+直接失败（`bun install --frozen-lockfile` 找不到 lock 时会报错退出）。
+
+### 解锁步骤（在有 Bun 的机器/CI 上执行，约 1 分钟）
+
+```bash
+cd server
+bun install                 # 生成 server/bun.lock
+bun run typecheck           # 顺手把 T01/T02 积压的类型检查跑一遍
+bun test                    # T02 未写 bun:test 用例，此步会显示 0 tests（正常）
+cd ..
+git add server/bun.lock
+git commit -m "chore(server): 提交 bun.lock，锁定后端依赖"
+```
+
+然后把 `server/Dockerfile` 的 `bun install --production` 改成：
+
+```dockerfile
+RUN bun install --production --frozen-lockfile
+```
+
+并删掉 Dockerfile 里那条 TODO 注释。
+
+### 为什么现在不"凑"一个 lock
+
+- 用 npm 生成 `package-lock.json` 塞进 `server/` 是**假 lock**：Bun 不读它，
+  镜像构建照样不可复现，还会让人误以为已经锁定；
+- 手写 `bun.lock` 更糟：Bun 会校验 integrity，手写必然与实际 tarball 不匹配。
+
+所以这里只记录 TODO，不做替代动作。
+
+### 同一批待办里还有两条（T02 发现，非阻塞）
+
+1. `server/package.json` 里仍留着 `drizzle-orm` / `drizzle-kit`，但 T01/T02 的
+   数据层全部走 `bun:sqlite` 原生 SQL（见 `server/src/db/client.ts` 注释）。
+   这两个依赖当前**未被引用**。等有 Bun 环境时一并决定：要么删掉（推荐，
+   可省掉 `drizzle-kit` 那一串传递依赖），要么在 T03 用它做类型化查询。
+2. `bun run typecheck` 需要在 `bun install` 之后才能跑（`tsc` 与 `@types/bun` 都在
+   `devDependencies` 里）。T02 的替代验证见下节。
+
+---
+
+## 7. T02 的替代验证方式（无 Bun / 无 Docker 时怎么保证质量）
+
+`server/scripts/verify-t02.mjs` 只用 **Node 22 自带能力**跑真断言，覆盖：
+
+| 覆盖点 | 手段 |
+|---|---|
+| 迁移可执行 + 幂等 | `node:sqlite` 真跑 `0001_init.sql` |
+| **乐观锁 20 并发只成功 1 个** | 从 `src/db/repos/canvas-sql.ts` **正则抽取** `SQL_UPDATE_CANVAS_CAS` 原文后在 SQLite 上执行（不是抄一份 SQL） |
+| **doc 清洗后 DB 无内联 base64 / blob:** | 直接 `import` `src/services/doc-sanitizer.ts`（Node 22 默认类型剥离），清洗结果真写进 SQLite 再读回断言 |
+| **路径穿越 400** | 直接 `import` `src/storage/key.ts`，17 组恶意 key 全部断言抛错 |
+| 内容寻址 / Range / 去重 / 原子写 | 直接 `import` `src/storage/local-disk.ts`，在临时目录真读写 |
+| 全部 `.ts` 语法 | `node:module` 的 `stripTypeScriptTypes()` 逐文件解析（等价 tsc 语法阶段） |
+
+运行：`cd server && node scripts/verify-t02.mjs`
+
+**它不能替代**的部分（必须在有 Bun 的机器上补跑）：
+`bun install` / `bun run typecheck` / `bun test` / 服务真实启动 + `curl` 登录画布全链路 /
+`docker compose build`。

@@ -45,9 +45,19 @@ const envSchema = z.object({
     // ===== 鉴权 =====
     AUTH_SECRET: z.string().min(32, "AUTH_SECRET 至少 32 字符，请用 `openssl rand -base64 48` 生成"),
     SESSION_TTL_DAYS: intFromEnv(30),
+    /** 会话 Cookie 名（HttpOnly，不透明 token 存这里）。 */
+    SESSION_COOKIE_NAME: z.string().min(1).default("ic_session"),
     ALLOW_REGISTRATION: boolFromEnv(false),
     LOGIN_RATE_LIMIT_PER_MIN: intFromEnv(5),
     COOKIE_SECURE: boolFromEnv(true),
+    /**
+     * 是否信任 `X-Forwarded-For`（Caddy 反代会写）。
+     *
+     * 生产必须为 true，否则限流会把所有请求算到同一个 IP（Caddy 的内网地址），
+     * "同 IP+账号 5 次/分" 退化成"全站 5 次/分"。
+     * 直接裸跑 `bun run dev`（无代理）时应设为 false。
+     */
+    TRUST_PROXY: boolFromEnv(true),
 
     // ===== 存储 =====
     STORAGE_DRIVER: z.enum(["local", "cos", "oss", "minio"]).default("local"),

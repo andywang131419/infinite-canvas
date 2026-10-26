@@ -89,6 +89,11 @@ services:
             ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
             LOGIN_RATE_LIMIT_PER_MIN: ${LOGIN_RATE_LIMIT_PER_MIN:-5}
             COOKIE_SECURE: ${COOKIE_SECURE:-true}
+            # 会话 Cookie 名（HttpOnly，不透明 token）
+            SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-ic_session}
+            # 生产必须 true：Caddy 用 X-Forwarded-For 传真实客户端 IP，
+            # 否则"同 IP+账号 5 次/分"的登录限流会把全站算成一个 IP。
+            TRUST_PROXY: ${TRUST_PROXY:-true}
 
             STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
             STORAGE_LOCAL_ROOT: ${STORAGE_LOCAL_ROOT:-/data/media}

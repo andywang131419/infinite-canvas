@@ -13,10 +13,15 @@
 import { Hono } from "hono";
 
 import { checkDbHealth, closeDb, getDb, getMigrationInfo } from "./db/client";
+import { purgeSessions } from "./db/repos/sessions";
 import { EnvValidationError, getEnv, type Env } from "./env";
 import { handleError, handleNotFound } from "./http/respond";
 import { startWorker, stopWorker } from "./jobs/worker";
+import { assetRoutes } from "./routes/assets";
+import { authRoutes } from "./routes/auth";
+import { canvasRoutes } from "./routes/canvases";
 import { healthRoutes } from "./routes/health";
+import { setupRoutes } from "./routes/setup";
 
 /** 构建 Hono 应用（不含副作用，便于测试直接 import）。 */
 export function createApp(): Hono {
@@ -25,8 +30,22 @@ export function createApp(): Hono {
     app.onError(handleError);
     app.notFound(handleNotFound);
 
-    // T01 只挂健康检查；T02 起依次挂 auth / canvases / assets / channels ...
+    /**
+     * 路由挂载顺序（T02 起）：
+     * - `/api/health*`    —— 不需鉴权（compose healthcheck 用）
+     * - `/api/setup*`     —— 不需鉴权，但**仅 users 表为空时**才真正生效
+     * - `/api/auth/*`     —— login 不需鉴权；logout / me 自行判断会话
+     * - `/api/canvases/*` —— 全部 requireAuth
+     * - `/api/assets/*`   —— 全部 requireAuth
+     *
+     * 注意：**没有**全局鉴权中间件。每个受保护路由自己挂 `requireAuth`，
+     * 这样 grep 一次就能审计出全部受保护端点（见 auth/middleware.ts 注释）。
+     */
     app.route("/api", healthRoutes);
+    app.route("/api", setupRoutes);
+    app.route("/api", authRoutes);
+    app.route("/api", canvasRoutes);
+    app.route("/api", assetRoutes);
 
     return app;
 }
@@ -62,6 +81,10 @@ async function main(): Promise<void> {
     } else {
         console.info(`[boot] 迁移已是最新（共 ${migrations.total} 个，无新增）`);
     }
+
+    // 启动时顺手清理过期/已吊销的会话记录（幂等、极便宜，避免 sessions 表无限膨胀）。
+    const purged = purgeSessions();
+    if (purged > 0) console.info(`[boot] 清理过期会话 ${purged} 条`);
 
     // ---- 3. Worker ----
     startWorker();
