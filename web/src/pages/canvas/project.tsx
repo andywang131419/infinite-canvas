@@ -20,12 +20,13 @@ import {
     isAudioJobType,
     isImageJobType,
     isRecoverableJobType,
+    isTerminalJobStatus,
     isVideoJobType,
     jobErrorMessage,
     resolveImageWriteTarget,
     videoAspectRatioForJob,
 } from "@/services/api/job-utils";
-import { cancelJob, createJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
+import { cancelJob, createJob, getJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
 import { describeStoredFile, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -305,6 +306,14 @@ function InfiniteCanvasPage() {
      * 2. **可停**——"停止生成"要能真正掐断恢复中的轮询，否则用户点了停止还在后台转。
      */
     const jobRecoveryRef = useRef(new Map<string, AbortController>());
+    /**
+     * 每个节点上**还在接续**的任务数。
+     *
+     * "一次生成 4 张"是同一个节点的 4 个 job，它们共用一个 `runningNodeId`。
+     * 第一张写回就把 `runningNodeId` 清掉的话，剩下 3 张的停止按钮会消失 ——
+     * 用户点不了停止，服务端继续跑继续扣费。所以要按节点计数，归零才清。
+     */
+    const recoveryNodeCountsRef = useRef(new Map<string, number>());
 
     const createHistoryEntry = useCallback(
         (): CanvasHistoryEntry => ({
@@ -426,6 +435,20 @@ function InfiniteCanvasPage() {
                 if (jobRecoveryRef.current.has(job.id)) continue;
                 const controller = new AbortController();
                 jobRecoveryRef.current.set(job.id, controller);
+                // 必须同时登记进 `generationRequestsRef` 并点亮 `runningNodeId`（P1）：
+                // 停止按钮由 `runningNodeId` 驱动，而 `stopGenerationByRunningId` 又是按
+                // `generationRequestsRef` 里 `runningNodeId` 匹配的记录收集受影响节点、
+                // 再对它们身上的 jobId 逐个 `cancelJob`。两样都缺的话，刷新恢复的任务
+                // 用户**点不了停止**，服务端继续跑继续扣费 —— 和"点停止不停服务端"
+                // 是同一类事故，只是发生在恢复路径上。
+                //
+                // 键用 **job.id 而不是 nodeId**：`generationRequestsRef` 按 targetNodeId
+                // 唯一，而"一次生成 4 张"是同一个节点上的 4 个 job。用 nodeId 当键的话
+                // 后登记的那个会把前一个的 controller abort 掉 —— 恢复时 4 张里有 3 张
+                // 会在刚接上的瞬间被自己人取消。
+                startGenerationRequest(job.id, job.nodeId, job.nodeId, controller);
+                recoveryNodeCountsRef.current.set(job.nodeId, (recoveryNodeCountsRef.current.get(job.nodeId) || 0) + 1);
+                setRunningNodeId(job.nodeId);
                 void (async () => {
                     const signal = controller.signal;
                     /** 失败落点：图像能定位到具体某张就只标那张，否则整节点标红。 */
@@ -501,11 +524,19 @@ function InfiniteCanvasPage() {
                         if (!isGenerationCanceled(error)) reportFailure(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
                     } finally {
                         jobRecoveryRef.current.delete(job.id);
+                        finishGenerationRequest(job.id, controller);
+                        const remaining = (recoveryNodeCountsRef.current.get(job.nodeId) || 1) - 1;
+                        if (remaining > 0) recoveryNodeCountsRef.current.set(job.nodeId, remaining);
+                        else {
+                            recoveryNodeCountsRef.current.delete(job.nodeId);
+                            // 这个节点上接续的任务全部结束了才收起停止按钮。
+                            setRunningNodeId((current) => (current === job.nodeId ? null : current));
+                        }
                     }
                 })();
             }
         },
-        [applyImageItem, markImageError, t],
+        [applyImageItem, finishGenerationRequest, markImageError, startGenerationRequest, t],
     );
 
     /**
@@ -525,6 +556,39 @@ function InfiniteCanvasPage() {
             return { jobs: [] as JobDto[], nodeIds: new Set<string>() };
         }
     }, [projectId]);
+
+    /**
+     * 补捞"已经跑完、但结果还没写回画布"的任务（P1）。
+     *
+     * `open=true` 在服务端是 `status IN ('queued','running')` —— 任务要是在
+     * "页面卸载 → 这次 restore()" 之间跑完，列表里就没有它了，节点被判"已中断"，
+     * 而服务端**已经生成好并落盘**了：**钱花了、用户看不到**，storageKey 成孤儿。
+     *
+     * 不去拉历史终态列表（那等于每次刷新把所有历史任务翻一遍）。节点自己就记着
+     * jobId（`metadata.jobId` / `images[].jobId`，随画布同步持久化），所以只要
+     * 对着"还停在 loading 的节点"把它存的任务 id 直接取回来即可 —— 精确、零冗余。
+     *
+     * 已经写回过的任务不会造成副作用：写回落点判定此时会落到 `skip`，什么都不写。
+     */
+    const fetchFinishedButUnclaimedJobs = useCallback(async (nodes: CanvasNodeData[], knownJobIds: Set<string>) => {
+        const candidates = new Set<string>();
+        for (const node of nodes) {
+            const images = node.metadata?.images || [];
+            const hasPendingImage = images.some((image) => image.status === NODE_STATUS_LOADING);
+            if (node.metadata?.status !== NODE_STATUS_LOADING && !hasPendingImage) continue;
+            if (node.metadata?.jobId) candidates.add(node.metadata.jobId);
+            for (const image of images) {
+                // 只捞还在 loading 的那张：已经 success 的那张说明结果早就写回去了。
+                if (image.status === NODE_STATUS_LOADING && image.jobId) candidates.add(image.jobId);
+            }
+        }
+        const missing = [...candidates].filter((jobId) => !knownJobIds.has(jobId));
+        if (!missing.length) return [] as JobDto[];
+        const settled = await Promise.all(missing.map((jobId) => getJob(jobId).catch(() => null)));
+        // 只要可恢复类型，且**确实已经终态** —— 还在跑的那些 open 列表已经给了，
+        // 重复 attach 会被 `jobRecoveryRef` 挡掉，但没必要多建一轮轮询。
+        return settled.filter((job): job is JobDto => Boolean(job) && isRecoverableJobType(job?.type) && isTerminalJobStatus(job?.status));
+    }, []);
 
     /**
      * 视频生成：提交到服务端队列 → 轮询 → 写回（T04-B 阶段 2）。
@@ -737,12 +801,20 @@ function InfiniteCanvasPage() {
             // 用户会看到"红一下又转起来"，而节点上的错误文案要等任务结束才被覆盖。
             const { jobs: openJobs, nodeIds: busyNodeIds } = await fetchOpenGenerationJobs();
             const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes, busyNodeIds));
+            // 补捞"已跑完但还没写回"的任务：`open=true` 不含终态，任务在页面卸载期间
+            // 跑完的话不会出现在上面的列表里，结果会成孤儿（钱花了、用户看不到）。
+            // 这一步必须在 attach 之前 —— 两批任务合并后才一次性登记，避免重复建轮询。
+            const finishedJobs = await fetchFinishedButUnclaimedJobs(
+                restoredNodes,
+                new Set(openJobs.map((job) => job.id)),
+            );
+            const resumableJobs = [...openJobs, ...finishedJobs];
             const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
             setNodes(restoredNodes);
             // 必须在 setNodes 之后、且把 restoredNodes 显式传进去：
             // 写回按节点 id / imageId 定位，而 nodesRef 要等 useLayoutEffect 才更新（709 行），
             // 此刻读它拿到的还是上一个画布。
-            attachOpenJobs(openJobs, restoredNodes);
+            attachOpenJobs(resumableJobs, restoredNodes);
             setConnections(project.connections);
             setChatSessions(restoredSessions);
             setActiveChatId(project.activeChatId || null);
@@ -766,7 +838,7 @@ function InfiniteCanvasPage() {
             setProjectLoaded(true);
         };
         void restore();
-    }, [attachOpenJobs, fetchOpenGenerationJobs, hydrated, navigate, openProject, projectId]);
+    }, [attachOpenJobs, fetchFinishedButUnclaimedJobs, fetchOpenGenerationJobs, hydrated, navigate, openProject, projectId]);
 
     // 这里原本还有一个"挂载后对 hasResumableVideoTask 的节点自动 pollVideoNodeTask"的
     // effect（视频双轨的本地半边）。视频改走服务端队列后，它的恢复已经并入上面的
