@@ -1476,6 +1476,108 @@ check("sendRequest：先看 content-length 再读 body（512MB 上限真的能�
 });
 
 // ---------------------------------------------------------------------------
+// [10] 备份审计的「去向」必须诚实
+//
+// 背景：server 镜像是 `oven/bun`，里面**没有 rclone**。`uploadWithRclone` 遇到
+// ENOENT 时返回 false 且不算失败 —— 这个设计保留（本地至少有一份，不该判死整次
+// 备份）。但审计行不能因此继续写 `target='remote:dest'` + success，那等于告诉
+// 运维"数据已经异地了"，实际只躺在 stage 目录。与「备份失败必须可见」同一条原则。
+// ---------------------------------------------------------------------------
+
+const backupServiceSource = readFileSync(join(repoRoot, "src/services/backup-service.ts"), "utf8");
+// 单独成文件就是为了这里能真 import：`backup-service.ts` 经 `db/client.ts`
+// 传递依赖 `bun:sqlite`，在 Node 上 import 会直接报不支持的 URL scheme。
+const { resolveBackupTarget, uploadWithRclone, isMissingBinary } = await import("../src/services/backup-target.ts");
+const { execFileSync } = await import("node:child_process");
+
+const STAGE_DIR_FOR_TEST = "/data/backups";
+const baseTarget = { label: "", remote: "", dest: "", stageDir: STAGE_DIR_FOR_TEST, uploaded: null };
+
+check("审计 target：BACKUP_TARGET_LABEL 非空时行为不变（人工标签绝不改写）", () => {
+    assertEqual(
+        resolveBackupTarget({ ...baseTarget, label: "oss://my-bucket", remote: "gdrive", dest: "ic", uploaded: false }),
+        "oss://my-bucket",
+        "人工标签被改写了 —— 用户写什么就是什么，真相由 uploaded 列承担",
+    );
+});
+
+check("审计 target：rclone 存在且上传成功 → 写远端", () => {
+    assertEqual(resolveBackupTarget({ ...baseTarget, remote: "gdrive", dest: "ic", uploaded: true }), "gdrive:ic", "上传成功却没写远端");
+});
+
+check("审计 target：配了远端但没传成（rclone 缺失）→ 降级 stageDir，不再谎称在远端", () => {
+    assertEqual(
+        resolveBackupTarget({ ...baseTarget, remote: "gdrive", dest: "ic", uploaded: false }),
+        STAGE_DIR_FOR_TEST,
+        "没传成却仍写远端路径 —— 正是这次要消灭的审计说谎",
+    );
+});
+
+check("审计 target：没配远端 → stageDir", () => {
+    assertEqual(resolveBackupTarget({ ...baseTarget, uploaded: null }), STAGE_DIR_FOR_TEST, "没配远端却写了别的路径");
+});
+
+check("审计 target：running 行（还没轮到上传）→ 写**意图**目的地", () => {
+    assertEqual(resolveBackupTarget({ ...baseTarget, remote: "gdrive", dest: "ic", uploaded: null }), "gdrive:ic", "running 行丢了意图目的地");
+});
+
+check("isMissingBinary：只认 ENOENT", () => {
+    assertEqual(isMissingBinary({ code: "ENOENT" }), true, "ENOENT 未被识别为命令缺失");
+    assertEqual(isMissingBinary({ code: "EACCES" }), false, "EACCES 被误判为命令缺失 —— 会掩盖真失败");
+    assertEqual(isMissingBinary(null), false, "null 被判成命令缺失");
+    assertEqual(isMissingBinary("boom"), false, "字符串被判成命令缺失");
+});
+
+// 只有本机确实没装 rclone 时才去真跑"配了远端但命令不存在"这条分支；
+// 装了的话真跑会去连一个不存在的远端，那不是本条想验的事。
+let rcloneInstalled = true;
+try {
+    execFileSync("rclone", ["version"], { stdio: "ignore" });
+} catch (error) {
+    rcloneInstalled = error?.code !== "ENOENT";
+}
+
+const previousRemote = process.env.RCLONE_REMOTE;
+delete process.env.RCLONE_REMOTE;
+resetEnvCache();
+const uploadNoRemote = await uploadWithRclone(STAGE_DIR_FOR_TEST);
+
+process.env.RCLONE_REMOTE = "gdrive";
+resetEnvCache();
+const uploadMissingBin = rcloneInstalled ? null : await uploadWithRclone(STAGE_DIR_FOR_TEST);
+
+if (previousRemote === undefined) delete process.env.RCLONE_REMOTE;
+else process.env.RCLONE_REMOTE = previousRemote;
+resetEnvCache();
+
+check("uploadWithRclone：没配远端 → 直接跳过（false）", () => {
+    assertEqual(uploadNoRemote, false, "没配远端却返回 true");
+});
+
+check("uploadWithRclone：配了远端但没装 rclone → 返回 false 且不抛错（本地至少有一份）", () => {
+    if (rcloneInstalled) {
+        console.log("      (本机已装 rclone，跳过：本条要验的是 server 镜像没装的情形)");
+        return;
+    }
+    assertEqual(uploadMissingBin, false, "没装 rclone 却返回 true —— 审计会说谎");
+});
+
+check("backup-service：终态 target 走 resolveBackupTarget，uploaded 一并入库", () => {
+    assert(/resolveBackupTarget/.test(backupServiceSource), "backup-service 未使用 resolveBackupTarget");
+    const finishCall = /finishBackupSuccess\([\s\S]*?\);/.exec(backupServiceSource);
+    assert(finishCall, "找不到 finishBackupSuccess 调用");
+    assert(/target: finalTarget/.test(finishCall[0]), "finishBackupSuccess 传的不是降级后的 target");
+    assert(/uploaded/.test(finishCall[0]), "finishBackupSuccess 没有把 uploaded 写进审计行");
+});
+
+check("backups 审计表：0003 迁移加了 uploaded 列，success 收尾会写它", () => {
+    const migration = readFileSync(join(repoRoot, "migrations/0003_backup_uploaded.sql"), "utf8");
+    assert(/ALTER TABLE backups ADD COLUMN uploaded/i.test(migration), "0003 迁移没有加 uploaded 列");
+    const repoSource = readFileSync(join(repoRoot, "src/db/repos/backups.ts"), "utf8");
+    assert(/uploaded = \?/.test(repoSource), "SQL_FINISH_SUCCESS 没有写 uploaded 列");
+});
+
+// ---------------------------------------------------------------------------
 // 汇总
 // ---------------------------------------------------------------------------
 

@@ -20,13 +20,13 @@
  * 且服务端进程内做 tar 需要额外库。媒体备份交给 cron 容器的 `BACKUP_INCLUDE_MEDIA=true`。
  */
 
-import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { gzip as gzipCallback } from "node:zlib";
 
+import { resolveBackupTarget, uploadWithRclone } from "./backup-target";
 import { getDb } from "../db/client";
 import {
     finishBackupFailed,
@@ -42,7 +42,6 @@ import { getEnv } from "../env";
 import { ApiError } from "../http/errors";
 
 const gzip = promisify(gzipCallback);
-const execFileAsync = promisify(execFile);
 
 /** 统计媒体目录的结果。 */
 export type MediaStats = { files: number; bytes: number };
@@ -56,6 +55,14 @@ export type BackupDto = {
     mediaFiles: number | null;
     mediaBytes: number | null;
     target: string | null;
+    /**
+     * 是否真的传到了远端：`true` 已传 / `false` 配了远端但没传成（含没装 rclone）/
+     * `null` 没配远端或还没轮到这一步。
+     *
+     * 单看 `target` 不够：人工标签（`BACKUP_TARGET_LABEL`）场景下 target 是用户
+     * 自己写的字符串，无法从它判断有没有真的上传，必须靠这个字段。
+     */
+    uploaded: boolean | null;
     errorMessage: string | null;
     startedAt: string;
     finishedAt: string | null;
@@ -71,6 +78,7 @@ export function toBackupDto(row: BackupRow): BackupDto {
         mediaFiles: row.media_files,
         mediaBytes: row.media_bytes,
         target: row.target,
+        uploaded: row.uploaded === null ? null : row.uploaded === 1,
         errorMessage: row.error_message,
         startedAt: row.started_at,
         finishedAt: row.finished_at,
@@ -91,8 +99,11 @@ export type BackupRunResult = {
     file: string;
     /** 实际字节数（压缩后）。 */
     bytes: number;
-    /** 是否上传到了 rclone 远端。 */
-    uploaded: boolean;
+    /**
+     * 是否上传到了 rclone 远端（三态，与审计列一致）：
+     * `true` 已传 / `false` 配了远端但没传成 / `null` 没配远端。
+     */
+    uploaded: boolean | null;
     /** 保留策略删掉的文件数。 */
     prunedFiles: number;
 };
@@ -124,9 +135,17 @@ export async function runBackup(trigger: BackupTrigger = "manual"): Promise<Back
     const stageDir = env.BACKUP_STAGE_DIR;
     const snapshotPath = join(stageDir, `.snapshot-${stamp}.sqlite`);
     const outputPath = join(stageDir, `app-${stamp}.sqlite.gz`);
-    const target = env.BACKUP_TARGET_LABEL || (env.RCLONE_REMOTE ? `${env.RCLONE_REMOTE}:${env.RCLONE_DEST}` : stageDir);
 
-    insertBackupRun(id, trigger, target, startedAt);
+    // running 行还不知道上传成不成，uploaded 传 null → 写的是**意图**目的地。
+    const intendedTarget = resolveBackupTarget({
+        label: env.BACKUP_TARGET_LABEL,
+        remote: env.RCLONE_REMOTE,
+        dest: env.RCLONE_DEST,
+        stageDir,
+        uploaded: null,
+    });
+
+    insertBackupRun(id, trigger, intendedTarget, startedAt);
 
     let dbBytes = 0;
     let media: MediaStats = { files: 0, bytes: 0 };
@@ -146,16 +165,29 @@ export async function runBackup(trigger: BackupTrigger = "manual"): Promise<Back
         media = env.BACKUP_INCLUDE_MEDIA ? await countMedia(env.STORAGE_LOCAL_ROOT) : { files: 0, bytes: 0 };
 
         // ---- 4. 上传 ----
-        const uploaded = await uploadWithRclone(stageDir);
+        const uploadedRaw = await uploadWithRclone(stageDir);
+        // 没配远端时 uploaded 是 null（"不适用"），配了才区分成/不成。
+        const uploaded = env.RCLONE_REMOTE ? uploadedRaw : null;
 
         // ---- 5. 清理 ----
         const prunedFiles = await pruneLocalBackups(stageDir, env.BACKUP_DB_KEEP_DAYS);
         pruneBackupRows(env.BACKUP_DB_KEEP_DAYS);
 
-        const finishedAt = new Date().toISOString();
-        finishBackupSuccess(id, { dbBytes, mediaFiles: media.files, mediaBytes: media.bytes, target }, finishedAt);
+        // 终态的 target 必须是**真实去向**：配了远端却没传成（典型是 server 镜像里
+        // 没装 rclone）时降回 stageDir，不能让审计行继续谎称数据已在远端。
+        // 人工标签 BACKUP_TARGET_LABEL 由 resolveBackupTarget 原样返回，不受影响。
+        const finalTarget = resolveBackupTarget({
+            label: env.BACKUP_TARGET_LABEL,
+            remote: env.RCLONE_REMOTE,
+            dest: env.RCLONE_DEST,
+            stageDir,
+            uploaded,
+        });
 
-        console.info(`[backup] 手动备份完成：${outputPath}（${dbBytes} bytes，上传=${uploaded}，清理=${prunedFiles}）`);
+        const finishedAt = new Date().toISOString();
+        finishBackupSuccess(id, { dbBytes, mediaFiles: media.files, mediaBytes: media.bytes, target: finalTarget, uploaded }, finishedAt);
+
+        console.info(`[backup] 手动备份完成：${outputPath}（${dbBytes} bytes，上传=${uploaded}，清理=${prunedFiles}，去向=${finalTarget}）`);
 
         return {
             backup: {
@@ -165,7 +197,8 @@ export async function runBackup(trigger: BackupTrigger = "manual"): Promise<Back
                 dbBytes,
                 mediaFiles: media.files,
                 mediaBytes: media.bytes,
-                target,
+                target: finalTarget,
+                uploaded,
                 errorMessage: null,
                 startedAt,
                 finishedAt,
@@ -240,39 +273,8 @@ async function countMedia(root: string): Promise<MediaStats> {
     return { files, bytes };
 }
 
-/**
- * 用 rclone 上传最近产生的快照。
- *
- * 未配置远端或本机没有 rclone 时返回 false（**不算失败**：
- * 本地备份文件已经存在，符合"至少有一份"的底线）。
- */
-async function uploadWithRclone(stageDir: string): Promise<boolean> {
-    const env = getEnv();
-    if (!env.RCLONE_REMOTE) return false;
-
-    try {
-        await execFileAsync(
-            "rclone",
-            ["copy", stageDir, `${env.RCLONE_REMOTE}:${env.RCLONE_DEST}`, "--include", "app-*.sqlite.gz", "--stats-one-line"],
-            { timeout: 10 * 60_000, maxBuffer: 4 * 1024 * 1024 },
-        );
-        return true;
-    } catch (error) {
-        // 找不到 rclone 命令 = 部署时没装，按"未上传"处理；其他错误才算真失败。
-        if (isMissingBinary(error)) {
-            console.warn("[backup] 未找到 rclone 命令，跳过远端上传（本地备份仍有效）");
-            return false;
-        }
-        throw new Error(`rclone 上传失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-}
-
-/** 判断是否是"命令不存在"。 */
-function isMissingBinary(error: unknown): boolean {
-    if (!error || typeof error !== "object") return false;
-    const code = (error as { code?: string }).code;
-    return code === "ENOENT";
-}
+// `uploadWithRclone` 与 `isMissingBinary` 已挪到 `./backup-target`（不依赖数据库，
+// 才能在 Node 上被 verify 脚本真实 import 执行）。行为未改：ENOENT 仍然不算失败。
 
 /** 删除超过保留期的本地备份文件。 */
 async function pruneLocalBackups(stageDir: string, keepDays: number): Promise<number> {

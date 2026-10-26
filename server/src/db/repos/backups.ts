@@ -24,6 +24,11 @@ export type BackupRow = {
     media_files: number | null;
     media_bytes: number | null;
     target: string | null;
+    /**
+     * 是否真的传到了远端（0003 迁移加的列）：1 = 已传 / 0 = 配了远端但没传成 /
+     * NULL = 没配远端或还没轮到这一步。
+     */
+    uploaded: number | null;
     error_message: string | null;
     started_at: string;
     finished_at: string | null;
@@ -41,6 +46,7 @@ UPDATE backups
        media_files = ?,
        media_bytes = ?,
        target = ?,
+       uploaded = ?,
        error_message = NULL,
        finished_at = ?
  WHERE id = ?
@@ -80,15 +86,23 @@ export function insertBackupRun(id: string, trigger: BackupTrigger, target: stri
     getDb().query(SQL_INSERT).run(id, trigger, target, startedAt);
 }
 
-/** 标记成功。 */
+/**
+ * 标记成功。
+ *
+ * `uploaded` 三态见 `BackupRow.uploaded` 注释。它和 `target` 一起决定"这次备份
+ * 到底去哪了"能不能自解释 —— 不能只写 target：配了远端但没传成时 target 会降级
+ * 成 stageDir，而人工标签场景下 target 是用户写的字符串，两种情况都靠 uploaded
+ * 才能真正说清有没有上远端。
+ */
 export function finishBackupSuccess(
     id: string,
-    metrics: { dbBytes: number; mediaFiles: number; mediaBytes: number; target: string | null },
+    metrics: { dbBytes: number; mediaFiles: number; mediaBytes: number; target: string | null; uploaded: boolean | null },
     finishedAt: string,
 ): void {
+    const uploaded = metrics.uploaded === null ? null : metrics.uploaded ? 1 : 0;
     getDb()
         .query(SQL_FINISH_SUCCESS)
-        .run(metrics.dbBytes, metrics.mediaFiles, metrics.mediaBytes, metrics.target, finishedAt, id);
+        .run(metrics.dbBytes, metrics.mediaFiles, metrics.mediaBytes, metrics.target, uploaded, finishedAt, id);
 }
 
 /** 标记失败（错误信息截断到 500 字符，避免整段堆栈进表）。 */
