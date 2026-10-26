@@ -186,6 +186,12 @@ services:
             # 远端目标留空 = 只做本地备份（/data/backups），不上传
             RCLONE_REMOTE: ${RCLONE_REMOTE:-}
             RCLONE_DEST: ${RCLONE_DEST:-}
+            # rclone 配置文件路径，**留空即用默认** /root/.config/rclone/rclone.conf
+            # （下面那条 ./rclone 挂载的位置）。只有要把 rclone.conf 放到别处才需要设。
+            #
+            # 不要透传 `RCLONE_CONFIG`（单数）：backup.sh 已经显式传 `--config`，
+            # rclone 的优先级是 flag > 环境变量，那个变量现在是死配置，传了也没人读。
+            RCLONE_CONFIG_FILE: ${RCLONE_CONFIG_FILE:-}
             TZ: ${TZ:-Asia/Shanghai}
         volumes:
             - data:/data
