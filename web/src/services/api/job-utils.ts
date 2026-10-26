@@ -155,6 +155,51 @@ export function videoAspectRatioForJob(size: string | null | undefined): string 
     return ratio === "auto" ? "16:9" : ratio;
 }
 
+/** 恢复时，一个**图像**任务的结果该写到哪里。 */
+export type ImageWriteTarget =
+    /** 批量图节点：写到 `metadata.images` 里这张（定位到了具体 imageId）。 */
+    | { kind: "image"; imageId: string }
+    /** 单图节点（局部重绘 / 多角度 / 内置面板写回 / 重试）：写到节点本身。 */
+    | { kind: "node" }
+    /** 节点都找不到了 —— 调用方只能放弃写回。 */
+    | null;
+
+/** 判定写回落点时需要的节点最小形状（刻意不 import canvas 类型，避免循环依赖）。 */
+type WriteTargetNode = {
+    metadata?: {
+        images?: readonly { id?: string; jobId?: string | null; status?: string | null }[] | null;
+    } | null;
+} | null | undefined;
+
+/**
+ * 图像任务的结果该写回哪里。
+ *
+ * 判定顺序：按 `jobId` 精确匹配 → 第一个还在 loading 且没认领的空位 →
+ * 第一张。三种都没命中说明这个节点**没有** `images[]`，那就是单图节点，
+ * 结果要写到 `metadata.content`。
+ *
+ * 最后这条是阶段 3 补的：次级入口（局部重绘 / 多角度 / 内置面板写回）建的
+ * 节点没有 `images[]`，原来的实现强制要求 imageId，拿不到就抛错 —— 于是
+ * 刷新后这些任务会被**错标成失败**，而服务端其实已经生成好了、钱也花了，
+ * 用户只看到一句红字。
+ *
+ * @param job 待写回的任务（需要 `id` 做精确匹配）
+ * @param node 任务所属节点，找不到就传 undefined
+ */
+export function resolveImageWriteTarget(job: { id?: string } | null | undefined, node: WriteTargetNode): ImageWriteTarget {
+    if (!node) return null;
+    const images = node.metadata?.images || [];
+    if (!images.length) return { kind: "node" };
+    const jobId = job?.id;
+    const matched = jobId ? images.find((image) => image.jobId === jobId) : undefined;
+    if (matched?.id) return { kind: "image", imageId: matched.id };
+    // 认领过 jobId 的空位说明已经有别的任务在写了，不能抢。
+    const pending = images.find((image) => image.status === "loading" && !image.jobId);
+    if (pending?.id) return { kind: "image", imageId: pending.id };
+    const first = images[0];
+    return first?.id ? { kind: "image", imageId: first.id } : { kind: "node" };
+}
+
 /**
  * job 失败时给用户的文案。
  *

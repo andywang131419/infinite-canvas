@@ -13,6 +13,7 @@ import {
     isVideoJobType,
     jobErrorMessage,
     mapJobStatusToNodeStatus,
+    resolveImageWriteTarget,
     videoAspectRatioForJob,
 } from "../src/services/api/job-utils";
 
@@ -103,6 +104,48 @@ describe("任务类型分派（阶段 2：audio / video 接队列）", () => {
         expect(isRecoverableJobType("video")).toBe(true);
         expect(isRecoverableJobType("llm")).toBe(false);
         expect(isRecoverableJobType(undefined)).toBe(false);
+    });
+});
+
+describe("结果写回落点（阶段 3）", () => {
+    // 局部重绘 / 多角度 / 内置面板写回建的**单图节点没有 images[]**。
+    // 旧实现强制要 imageId，拿不到就抛错 → 这些任务刷新后被错标失败，
+    // 而服务端其实已经生成好了、钱也花了，用户只看到一句红字。
+    it("没有 images[] 的节点 = 结果写到节点本身，不是失败", () => {
+        expect(resolveImageWriteTarget({ id: "job_1" }, { metadata: {} })).toEqual({ kind: "node" });
+        expect(resolveImageWriteTarget({ id: "job_1" }, { metadata: { images: [] } })).toEqual({ kind: "node" });
+        expect(resolveImageWriteTarget({ id: "job_1" }, {})).toEqual({ kind: "node" });
+    });
+
+    it("按 jobId 精确匹配那张图（批量图里失败单张重试靠它）", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", jobId: "job_1", status: "error" },
+                    { id: "img_2", jobId: "job_2", status: "loading" },
+                ],
+            },
+        };
+        expect(resolveImageWriteTarget({ id: "job_2" }, node)).toEqual({ kind: "image", imageId: "img_2" });
+    });
+
+    it("匹配不到就认领第一个还在 loading、且没被别的任务认领过的空位", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "success" },
+                    { id: "img_2", status: "loading", jobId: "job_9" },
+                    { id: "img_3", status: "loading" },
+                ],
+            },
+        };
+        // img_2 已经被 job_9 认领了，不能抢 —— 抢了就是两个任务写同一张图。
+        expect(resolveImageWriteTarget({ id: "job_new" }, node)).toEqual({ kind: "image", imageId: "img_3" });
+    });
+
+    it("节点都不存在了就返回 null，交给调用方放弃写回", () => {
+        expect(resolveImageWriteTarget({ id: "job_1" }, undefined)).toBe(null);
+        expect(resolveImageWriteTarget({ id: "job_1" }, null)).toBe(null);
     });
 });
 

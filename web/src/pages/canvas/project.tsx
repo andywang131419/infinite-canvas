@@ -22,6 +22,7 @@ import {
     isRecoverableJobType,
     isVideoJobType,
     jobErrorMessage,
+    resolveImageWriteTarget,
     videoAspectRatioForJob,
 } from "@/services/api/job-utils";
 import { cancelJob, createJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
@@ -405,7 +406,8 @@ function InfiniteCanvasPage() {
     }, []);
 
     /**
-     * 任务结果该写回哪张图：优先按 jobId 精确匹配，退化到第一个还在 loading 的空位。
+     * 任务结果该写回哪张图。真正的判定在 `resolveImageWriteTarget`（可单测），
+     * 这里只取"批量图里那张"的 id；单图节点返回空串，交给调用方写节点本身。
      *
      * `nodes` 必须由调用方显式传入，**不能**在这里读 `nodesRef.current`：
      * ref 是在 `useLayoutEffect` 里同步的（第 709 行），而恢复发生在 `restore()` 里
@@ -413,11 +415,8 @@ function InfiniteCanvasPage() {
      * 按它找图会把结果写进根本不存在的 imageId，或者退化成空串。
      */
     const pickImageIdForJob = useCallback((job: JobDto, nodes: CanvasNodeData[]) => {
-        const images = nodes.find((node) => node.id === job.nodeId)?.metadata?.images || [];
-        const matched = images.find((image) => image.jobId === job.id);
-        if (matched) return matched.id;
-        const pending = images.find((image) => image.status === NODE_STATUS_LOADING && !image.jobId);
-        return pending?.id ?? images[0]?.id ?? "";
+        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+        return target?.kind === "image" ? target.imageId : "";
     }, []);
 
     /**
@@ -467,13 +466,14 @@ function InfiniteCanvasPage() {
 
                         const storageKey = firstImageStorageKey(finished.resultStorageKeys);
                         if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
-                        const imageId = pickImageIdForJob(job, nodes);
+                        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+                        if (!target) throw new Error(t("canvas.projectPage.generationFailed"));
                         const described = await describeStoredImage(storageKey, { signal });
                         // 次级入口（局部重绘 / 多角度 / 内置面板写回 / 重试）的结果落在
                         // **节点本身**，节点上压根没有 `images[]`。这类任务刷新后如果不
                         // 单独处理，会因为"找不到 imageId"被错标成失败 —— 服务端其实
                         // 已经生成好了，钱也花了，用户只看到红字。
-                        if (!imageId) {
+                        if (target.kind === "node") {
                             setNodes((prev) =>
                                 prev.map((item) =>
                                     item.id === job.nodeId
@@ -487,8 +487,8 @@ function InfiniteCanvasPage() {
                             );
                             return;
                         }
-                        applyImageItem(job.nodeId, imageId, {
-                            id: imageId,
+                        applyImageItem(job.nodeId, target.imageId, {
+                            id: target.imageId,
                             jobId: job.id,
                             status: NODE_STATUS_SUCCESS,
                             content: described.url,
