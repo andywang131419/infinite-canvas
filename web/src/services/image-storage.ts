@@ -2,8 +2,11 @@ import localforage from "localforage";
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
-import { withLocalProxy } from "@/stores/use-config-store";
 import { createImageThumbnail } from "@/lib/image-thumbnail";
+import { fetchStoredAssetBlob, putServerAsset, scheduleAssetMigration, serverAssetUrl } from "@/services/asset-bridge";
+import { serverFetch } from "@/services/server-fetch";
+
+export { serverAssetUrl };
 
 export type UploadedImage = {
     url: string;
@@ -34,6 +37,17 @@ type StoredImagePreview = { version: number; blob?: Blob };
 
 type ImageReadOptions = { signal?: AbortSignal };
 
+/** 让用到这张图的界面重渲染一次（迁移完成后 URL 变了，必须重渲染才会重新请求）。 */
+function notifyAssetMigrated(): void {
+    previewRevision += 1;
+    previewListeners.forEach((listener) => listener());
+}
+
+/** 懒迁移入口：按 `image:` 命名空间读本地 Blob，成功后通知界面。 */
+function migrateLocalImage(storageKey: string): void {
+    scheduleAssetMigration(storageKey, () => store.getItem<Blob>(storageKey), notifyAssetMigrated);
+}
+
 export async function uploadImage(input: string | Blob, options?: ImageReadOptions): Promise<UploadedImage> {
     if (typeof input !== "string") return storeImage(input, options);
 
@@ -60,6 +74,9 @@ async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<Uploa
         throwIfAborted(options?.signal);
         objectUrls.set(storageKey, url);
         await storeImagePreview(storageKey, blob);
+        // 双写：本地是缓存，服务端才是跨设备的权威副本。
+        // 失败不抛（`putServerAsset` 内部吞掉），下次渲染时会走懒迁移重试。
+        await putServerAsset(storageKey, blob);
         return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
     } catch (error) {
         URL.revokeObjectURL(url);
@@ -79,7 +96,7 @@ async function fetchImageBlob(url: string, options?: ImageReadOptions) {
         controller.abort();
     }, IMAGE_DOWNLOAD_TIMEOUT_MS);
     try {
-        const response = await fetch(withLocalProxy(url), { signal: controller.signal });
+        const response = await serverFetch(url, { signal: controller.signal });
         if (!response.ok) throw namedError(IMAGE_RESPONSE_ERROR);
         return await response.blob();
     } catch (error) {
@@ -140,15 +157,34 @@ function throwIfAborted(signal?: AbortSignal) {
     if (signal?.aborted) throw abortReason(signal);
 }
 
+/**
+ * 由 storageKey 解析出可渲染的图片地址。
+ *
+ * T04-A4 之前：读 IndexedDB → `URL.createObjectURL` 生成 `blob:` 地址。
+ * 那条路径的问题很直白：`blob:` 地址绑在**当前浏览器会话**上，
+ * 换设备 / 清缓存 / 重装后画布里全是碎图。
+ *
+ * 现在：有 `storageKey` 就直接返回服务端同源地址（`/api/assets/raw?key=...`），
+ * **同步无 IO**，随便调用；同时在后台排一次懒迁移，
+ * 把"只有本地有、服务端还没有"的老资产补传上去。
+ * 只有拿不到 key 时才回落到调用方给的 fallback（例如 `data:` 内联图）。
+ */
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
     if (!storageKey) return fallback;
-    const cached = objectUrls.get(storageKey);
-    if (cached) return cached;
-    const blob = await store.getItem<Blob>(storageKey);
-    if (!blob) return fallback;
-    const url = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, url);
-    return url;
+    // 非本模块命名空间（如 `data:` / `http:` 内联地址）原样交给调用方。
+    if (!storageKey.startsWith("image:")) return fallback;
+    migrateLocalImage(storageKey);
+    return serverAssetUrl(storageKey);
+}
+
+/**
+ * 取一份图片字节（导出 / 作为生成参考图时用）。
+ *
+ * 顺序：本地 IndexedDB → 服务端。本地命中时省一次网络，
+ * 本地没有（典型场景：换了设备）就回源服务端，这正是"资产上云"要解决的。
+ */
+export function fetchStoredImageBlob(storageKey: string): Promise<Blob | null> {
+    return fetchStoredAssetBlob(storageKey, () => store.getItem<Blob>(storageKey));
 }
 
 export async function getImageBlob(storageKey: string) {
@@ -219,7 +255,9 @@ export async function setImageBlob(storageKey: string, blob: Blob) {
     await storeImagePreview(storageKey, blob);
     const url = URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
-    return url;
+    // 双写：覆盖本地后同步覆盖服务端副本，避免换设备拿到旧图。
+    const serverUrl = await putServerAsset(storageKey, blob);
+    return serverUrl ?? url;
 }
 
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }, options?: ImageReadOptions) {

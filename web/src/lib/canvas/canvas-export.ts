@@ -47,13 +47,13 @@ export async function exportCanvasNodes(nodes: CanvasNodeData[], fileName = i18n
             const title = node.title || node.type;
             const storageKey = node.metadata?.storageKey || "";
             if (storageKey) {
-                const blob = storageKey.startsWith("image:") ? await getImageBlob(storageKey) : await getMediaBlob(storageKey);
+                const blob = await readAssetBlob(storageKey);
                 if (blob) return void zipFiles.push({ name: uniqueName(title, fileExtension(blob.type, storageKey)), data: blob });
             }
             if (node.type === CanvasNodeType.Text) return void zipFiles.push({ name: uniqueName(title, "txt"), data: node.metadata?.content || node.metadata?.prompt || "" });
             const content = node.metadata?.content;
             if (content && content.startsWith("data:")) {
-                const blob = await (await fetch(content)).blob();
+                const blob = await (await serverFetch(content)).blob();
                 return void zipFiles.push({ name: uniqueName(title, fileExtension(blob.type, storageKey)), data: blob });
             }
             zipFiles.push({ name: uniqueName(title, "json"), data: JSON.stringify(node, null, 2) });
