@@ -1,5 +1,3 @@
-import axios from "axios";
-
 import i18n from "@/i18n";
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
@@ -28,7 +26,7 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
     if (script) {
         if (!model) throw new Error(apiText("audioModelRequired"));
         if (!requestConfig.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
-        if (!requestConfig.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+        if (!requestConfig.apiKey.trim() && !requestConfig.apiKeyHint) throw new Error(apiText("apiKeyRequired"));
         try {
             const result = await runModelPlugin({
                 capability: "audio",
@@ -40,14 +38,14 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
             });
             return await audioPluginBlob(result, format);
         } catch (error) {
-            throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
+            throw new Error(readUpstreamError(error, apiText("audioGenerationFailed")));
         }
     }
     assertAudioConfig(requestConfig, model);
     const instructions = config.audioInstructions.trim();
 
     try {
-        const response = await axios.post<Blob>(
+        const response = await upstreamPost<Blob>(
             aiApiUrl(requestConfig, "/audio/speech"),
             {
                 model,
@@ -62,7 +60,7 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
         await assertAudioBlob(response.data);
         return response.data.type.startsWith("audio/") ? response.data : new Blob([response.data], { type: audioMimeType(format) });
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
+        throw new Error(readUpstreamError(error, apiText("audioGenerationFailed")));
     }
 }
 
@@ -76,7 +74,7 @@ async function audioPluginBlob(result: unknown, format: string): Promise<Blob> {
     }
     if (!source) throw new Error(apiText("scriptNoAudio"));
     const url = source.startsWith("data:") || /^https?:/i.test(source) ? source : `data:${audioMimeType(format)};base64,${source}`;
-    const blob = await (await fetch(withLocalProxy(url))).blob();
+    const blob = await (await serverFetch(url)).blob();
     return blob.type.startsWith("audio/") ? blob : new Blob([blob], { type: audioMimeType(format) });
 }
 
@@ -88,7 +86,8 @@ export async function storeGeneratedAudio(blob: Blob, format = "mp3"): Promise<U
 function assertAudioConfig(config: AiConfig, model: string) {
     if (!model) throw new Error(apiText("audioModelRequired"));
     if (!config.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
-    if (!config.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+    // T04-A6：密钥只在服务端，本地拿 `apiKeyHint` 判断"是否配置过"。
+    if (!channelHasKey(config)) throw new Error(apiText("apiKeyRequired"));
     if (config.apiFormat === "gemini") throw new Error(apiText("geminiAudioUnsupported"));
 }
 
@@ -132,9 +131,9 @@ function readApiErrorMessage(value: unknown): string {
     );
 }
 
-function readAxiosError(error: unknown, fallback: string) {
-    if (axios.isCancel(error)) return apiText("requestCanceled");
-    if (axios.isAxiosError(error)) {
+function readUpstreamError(error: unknown, fallback: string) {
+    if (isUpstreamCancel(error)) return apiText("requestCanceled");
+    if (isUpstreamError(error)) {
         if (!error.response && error.code === "ERR_NETWORK") return apiText("requestFailed");
         const responseData = error.response?.data;
         const apiMsg = readApiErrorMessage(responseData);

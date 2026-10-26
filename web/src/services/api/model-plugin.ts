@@ -1,4 +1,4 @@
-import axios, { type AxiosRequestConfig } from "axios";
+import { isUpstreamCancel, upstreamRequest, type UpstreamRequestConfig } from "@/services/server-fetch";
 
 import i18n from "@/i18n";
 import { buildApiUrl, withLocalProxy, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
@@ -47,7 +47,7 @@ function pluginUrl(config: AiConfig, path: string) {
 function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHttp {
     const run = async (method: "get" | "post", path: string, body: unknown, opts?: PluginHttpOptions) => {
         const isForm = typeof FormData !== "undefined" && body instanceof FormData;
-        const response = await axios.request({
+        const response = await upstreamRequest({
             method,
             url: pluginUrl(config, path),
             data: method === "post" ? body : undefined,
@@ -67,8 +67,8 @@ function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHtt
 
 /** Raw request with no automatic auth header — the script controls method, url, headers, body entirely. */
 function createPluginRequest(config: AiConfig, options?: RequestOptions) {
-    return async (requestConfig: AxiosRequestConfig & { url: string }) => {
-        const response = await axios.request({ ...requestConfig, url: pluginUrl(config, requestConfig.url), signal: options?.signal });
+    return async (requestConfig: UpstreamRequestConfig & { url: string }) => {
+        const response = await upstreamRequest({ ...requestConfig, url: pluginUrl(config, requestConfig.url), signal: options?.signal });
         return response.data;
     };
 }
@@ -157,7 +157,7 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
         );
     } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") throw error;
-        if (axios.isCancel(error)) throw error;
+        if (isUpstreamCancel(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(i18n.t("modelPlugin.executionFailed", { message }));
     }
