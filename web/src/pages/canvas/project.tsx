@@ -6,13 +6,22 @@ import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
 import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
-import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
-import { createVideoGenerationTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask } from "@/services/api/video";
-import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { boolConfig, defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { describeStoredImage, ensureImagePreview, uploadImage } from "@/services/image-storage";
-import { buildImageJobIdempotencyKey, firstImageStorageKey, isImageJobType, jobErrorMessage } from "@/services/api/job-utils";
+import {
+    buildAudioJobIdempotencyKey,
+    buildImageJobIdempotencyKey,
+    buildVideoJobIdempotencyKey,
+    firstImageStorageKey,
+    firstStorageKeyWithPrefix,
+    isAudioJobType,
+    isImageJobType,
+    isRecoverableJobType,
+    isVideoJobType,
+    jobErrorMessage,
+} from "@/services/api/job-utils";
 import { cancelJob, createJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
-import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
+import { describeStoredFile, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
@@ -61,7 +70,6 @@ import {
     generationReferenceUrls,
     getGenerationCount,
     getInputSummary,
-    hasResumableVideoTask,
     hydrateAssistantImages,
     hydrateCanvasImages,
     imageExtension,
@@ -94,7 +102,6 @@ import {
     type ViewportTransform,
 } from "@/types/canvas";
 import type { ReferenceImage } from "@/types/image";
-import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
 // Register built-in nodes in the shared registry once when the module loads.
 registerBuiltinNodes();
@@ -285,7 +292,6 @@ function InfiniteCanvasPage() {
     const selectionBoxRef = useRef(selectionBox);
     const pendingConnectionCreateRef = useRef(pendingConnectionCreate);
     const generationRequestsRef = useRef(new Map<string, CanvasGenerationRequest>());
-    const videoPollIdsRef = useRef(new Set<string>());
     /**
      * 正在接续的 jobId → 它的 AbortController。
      *
@@ -411,37 +417,55 @@ function InfiniteCanvasPage() {
     }, []);
 
     /**
-     * 把服务端还在跑的图像任务**接回**画布。
+     * 把服务端还在跑的生成任务**接回**画布（image / audio / video）。
      *
      * 只做两件事：轮询 + 写回。绝不重新提交 —— 重新提交就是重复调上游、重复扣费。
+     *
+     * 音频/视频是阶段 2 加进来的：它们的结果**不是**图片，写回时要按类型挑
+     * 对应命名空间的 storageKey，所以用 `isVideoJobType` / `isAudioJobType`
+     * 分派，不能复用图像那条分支。
      */
-    const attachOpenImageJobs = useCallback(
+    const attachOpenJobs = useCallback(
         (jobs: JobDto[], nodes: CanvasNodeData[]) => {
             for (const job of jobs) {
                 if (jobRecoveryRef.current.has(job.id)) continue;
                 const controller = new AbortController();
                 jobRecoveryRef.current.set(job.id, controller);
                 void (async () => {
-                    const imageId = pickImageIdForJob(job, nodes);
+                    const signal = controller.signal;
+                    /** 失败落点：图像能定位到具体某张就只标那张，否则整节点标红。 */
                     const reportFailure = (errorDetails: string) => {
-                        if (!imageId) {
-                            setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
+                        const imageId = isImageJobType(job.type) ? pickImageIdForJob(job, nodes) : "";
+                        if (imageId) {
+                            markImageError(job.nodeId, imageId, errorDetails);
                             return;
                         }
-                        markImageError(job.nodeId, imageId, errorDetails);
+                        setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
                     };
                     try {
-                        const finished = await waitForJob(job.id, { signal: controller.signal });
-                        if (finished.status !== "succeeded") {
-                            reportFailure(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+                        const finished = await waitForJob(job.id, { signal });
+                        if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+
+                        if (isVideoJobType(job.type)) {
+                            const storageKey = firstStorageKeyWithPrefix(finished.resultStorageKeys, "video:");
+                            if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+                            const video = await describeStoredFile(storageKey, "video/mp4");
+                            setNodes((prev) => prev.map((item) => (item.id === job.nodeId ? applyGeneratedVideo(item, video) : item)));
                             return;
                         }
+                        if (isAudioJobType(job.type)) {
+                            const storageKey = firstStorageKeyWithPrefix(finished.resultStorageKeys, "audio:");
+                            if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+                            const audio = await describeStoredFile(storageKey, "audio/mpeg");
+                            setNodes((prev) => prev.map((item) => (item.id === job.nodeId ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio) } } : item)));
+                            return;
+                        }
+
                         const storageKey = firstImageStorageKey(finished.resultStorageKeys);
-                        if (!storageKey) {
-                            reportFailure(t("canvas.projectPage.generationFailed"));
-                            return;
-                        }
-                        const described = await describeStoredImage(storageKey, { signal: controller.signal });
+                        if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+                        const imageId = pickImageIdForJob(job, nodes);
+                        if (!imageId) throw new Error(t("canvas.projectPage.generationFailed"));
+                        const described = await describeStoredImage(storageKey, { signal });
                         applyImageItem(job.nodeId, imageId, {
                             id: imageId,
                             jobId: job.id,
@@ -468,94 +492,99 @@ function InfiniteCanvasPage() {
     /**
      * 打开画布时先问服务端"这个画布还有哪些活没干完"。
      *
+     * 只收 `image` / `audio` / `video` 三类：`llm` 任务不走队列（文本保持浏览器
+     * 直连流式），服务端不会有它们的未完成任务，收进来只会把不该动的节点跳过 reset。
+     *
      * 查不到（报错 / 未登录 / 服务端没开）时返回空集合，恢复退化成改动前的
      * "一律标中断" —— 查询失败不能把整个画布打不开。
      */
-    const fetchOpenImageJobs = useCallback(async () => {
+    const fetchOpenGenerationJobs = useCallback(async () => {
         try {
-            const jobs = (await listOpenJobs(projectId)).filter((job) => isImageJobType(job.type));
+            const jobs = (await listOpenJobs(projectId)).filter((job) => isRecoverableJobType(job.type));
             return { jobs, nodeIds: new Set(jobs.map((job) => job.nodeId)) };
         } catch {
             return { jobs: [] as JobDto[], nodeIds: new Set<string>() };
         }
     }, [projectId]);
 
-    const completeVideoNodeTask = useCallback(
-        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, images: Parameters<typeof createVideoGenerationTask>[2], signal: AbortSignal, extra: CanvasNodeData["metadata"] = {}, videos: ReferenceVideo[] = [], audios: ReferenceAudio[] = []) => {
-            const task = await createVideoGenerationTask(config, prompt, images, { signal, videos, audios });
-            if (task.provider !== "plugin") {
-                setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, videoTaskId: task.id, videoTaskProvider: task.provider === "gemini" ? "gemini" : "openai", model: config.model } } : item)));
-            }
-            const video = await storeGeneratedVideo(await waitForVideoGenerationTask(config, task, { signal }));
+    /**
+     * 视频生成：提交到服务端队列 → 轮询 → 写回（T04-B 阶段 2）。
+     *
+     * 这是**唯一**入口，取代原来的 `completeVideoNodeTask` + `pollVideoNodeTask`
+     * 双轨（浏览器直连 provider，把 provider 的 taskId 存进 `metadata.videoTaskId`，
+     * 刷新后再拿它去上游续轮询）。双轨留着等于"到底谁在生成"有两个答案，
+     * 而服务端队列已经是权威的那个。
+     *
+     * @param jobKey 幂等键种子：视频节点一次只出一个结果，没有子项 id 可用，
+     *   所以每次生成动作另起一个种子，避免"重新生成"命中上一次已完成的 job。
+     */
+    const runVideoJobForNode = useCallback(
+        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, references: ReferenceImage[], jobKey: string, signal: AbortSignal, extra: CanvasNodeData["metadata"] = {}) => {
+            const referenceStorageKeys = await resolveReferenceStorageKeys(references, signal);
+            const { job } = await createJob(
+                {
+                    canvasId: projectId,
+                    nodeId,
+                    type: "video",
+                    model: config.model,
+                    params: {
+                        prompt,
+                        references: referenceStorageKeys,
+                        seconds: Number(config.videoSeconds) || 8,
+                        size: config.size,
+                        resolution: config.vquality,
+                        generateAudio: boolConfig(config.videoGenerateAudio, true),
+                        watermark: boolConfig(config.videoWatermark, false),
+                    },
+                    idempotencyKey: buildVideoJobIdempotencyKey(nodeId, jobKey),
+                },
+                signal,
+            );
+            setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, jobId: job.id, jobKey, model: config.model } } : item)));
+            const finished = await waitForJob(job.id, { signal });
+            if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+            const storageKey = firstStorageKeyWithPrefix(finished.resultStorageKeys, "video:");
+            if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+            const video = await describeStoredFile(storageKey, "video/mp4");
             setNodes((prev) => prev.map((item) => (item.id === nodeId ? applyGeneratedVideo(item, video, { prompt, model: config.model, ...extra }) : item)));
         },
-        [],
+        [projectId, resolveReferenceStorageKeys, t],
     );
 
-    const pollVideoNodeTask = useCallback(
-        async (node: CanvasNodeData, silent = false) => {
-            const taskId = node.metadata?.videoTaskId;
-            if (!taskId || node.metadata?.content || generationRequestsRef.current.has(node.id) || videoPollIdsRef.current.has(node.id)) return;
-            videoPollIdsRef.current.add(node.id);
-            let controller: AbortController | undefined;
-            try {
-                const generationConfig = buildGenerationConfig(effectiveConfig, node, "video");
-                if (!isAiConfigReady(generationConfig, generationConfig.model)) {
-                    if (silent) {
-                        setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails: t("workbench.configFirst") } } : item)));
-                        return;
-                    }
-                    openConfigDialog(true);
-                    return;
-                }
-                setRunningNodeId(node.id);
-                setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined } } : item)));
-                controller = startGenerationRequest(node.id, node.id, node.id);
-                const video = await storeGeneratedVideo(await waitForVideoGenerationTask(generationConfig, { id: taskId, provider: node.metadata?.videoTaskProvider === "gemini" ? "gemini" : "openai", model: generationConfig.model }, { signal: controller.signal }));
-                setNodes((prev) =>
-                    prev.map((item) =>
-                        item.id === node.id
-                            ? applyGeneratedVideo(item, video, {
-                                  prompt: item.metadata?.prompt,
-                                  model: generationConfig.model,
-                                  size: generationConfig.size,
-                                  seconds: generationConfig.videoSeconds,
-                                  vquality: generationConfig.vquality,
-                                  generateAudio: generationConfig.videoGenerateAudio,
-                                  watermark: generationConfig.videoWatermark,
-                                  videoMode: generationConfig.videoMode,
-                              })
-                            : item,
-                    ),
-                );
-            } catch (error) {
-                if (isGenerationCanceled(error)) return;
-                const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
-                message.error(errorDetails);
-                setNodes((prev) =>
-                    prev.map((item) =>
-                        item.id === node.id
-                            ? {
-                                  ...item,
-                                  metadata: {
-                                      ...item.metadata,
-                                      status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
-                                      errorDetails: item.metadata?.content ? undefined : errorDetails,
-                                      ...(isVideoTaskFailed(error) ? { videoTaskId: undefined } : {}),
-                                  },
-                              }
-                            : item,
-                    ),
-                );
-            } finally {
-                videoPollIdsRef.current.delete(node.id);
-                if (controller) {
-                    finishGenerationRequest(node.id, controller);
-                    setRunningNodeId((current) => (current === node.id ? null : current));
-                }
-            }
+    /**
+     * 音频生成：同上，走服务端队列。
+     *
+     * 音频比图像简单（一次一条），但幂等键的坑一样：见 `buildAudioJobIdempotencyKey`。
+     */
+    const runAudioJobForNode = useCallback(
+        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, jobKey: string, signal: AbortSignal) => {
+            const { job } = await createJob(
+                {
+                    canvasId: projectId,
+                    nodeId,
+                    type: "audio",
+                    model: config.model,
+                    params: {
+                        prompt,
+                        voice: config.audioVoice,
+                        format: config.audioFormat,
+                        instructions: config.audioInstructions,
+                        // 语速为空字符串时传 undefined，让上游用自己的默认值（服务端会夹 0.25~4）。
+                        speed: config.audioSpeed ? Number(config.audioSpeed) : undefined,
+                    },
+                    idempotencyKey: buildAudioJobIdempotencyKey(nodeId, jobKey),
+                },
+                signal,
+            );
+            setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, jobId: job.id, jobKey } } : item)));
+            const finished = await waitForJob(job.id, { signal });
+            if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+            const storageKey = firstStorageKeyWithPrefix(finished.resultStorageKeys, "audio:");
+            if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+            const audio = await describeStoredFile(storageKey, "audio/mpeg");
+            setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(config) } } : item)));
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [projectId, t],
     );
 
     const stopGenerationByRunningId = useCallback((runningId: string) => {
@@ -631,14 +660,14 @@ function InfiniteCanvasPage() {
             // 顺序是**有意**的：先问服务端"这个画布还有哪些活没干完"，再决定谁该被标"已中断"。
             // 反过来（先 reset）会把服务端还在跑的图打成"已中断"，接着又 attach 上同一个 job，
             // 用户会看到"红一下又转起来"，而节点上的错误文案要等任务结束才被覆盖。
-            const { jobs: openJobs, nodeIds: busyNodeIds } = await fetchOpenImageJobs();
+            const { jobs: openJobs, nodeIds: busyNodeIds } = await fetchOpenGenerationJobs();
             const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes, busyNodeIds));
             const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
             setNodes(restoredNodes);
             // 必须在 setNodes 之后、且把 restoredNodes 显式传进去：
             // 写回按节点 id / imageId 定位，而 nodesRef 要等 useLayoutEffect 才更新（709 行），
             // 此刻读它拿到的还是上一个画布。
-            attachOpenImageJobs(openJobs, restoredNodes);
+            attachOpenJobs(openJobs, restoredNodes);
             setConnections(project.connections);
             setChatSessions(restoredSessions);
             setActiveChatId(project.activeChatId || null);
@@ -662,14 +691,12 @@ function InfiniteCanvasPage() {
             setProjectLoaded(true);
         };
         void restore();
-    }, [attachOpenImageJobs, fetchOpenImageJobs, hydrated, navigate, openProject, projectId]);
+    }, [attachOpenJobs, fetchOpenGenerationJobs, hydrated, navigate, openProject, projectId]);
 
-    useEffect(() => {
-        if (!projectLoaded) return;
-        nodesRef.current.filter(hasResumableVideoTask).forEach((node) => void pollVideoNodeTask(node, true));
-        // Resume once after the current canvas is restored, not on later config identity changes.
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [projectLoaded]);
+    // 这里原本还有一个"挂载后对 hasResumableVideoTask 的节点自动 pollVideoNodeTask"的
+    // effect（视频双轨的本地半边）。视频改走服务端队列后，它的恢复已经并入上面的
+    // restore()（查询 open jobs → attach），而这个 effect 只认 `videoTaskId`、
+    // 不认 jobId —— 留着就是一条永远走不到的死路径。
 
     useEffect(() => {
         if (!projectLoaded || !["new", "recent", "choose"].includes(searchParams.get("mode") || "")) return;
@@ -2744,6 +2771,8 @@ function InfiniteCanvasPage() {
                     const isEmptyVideoNode = sourceNode?.type === CanvasNodeType.Video && !sourceNode.metadata?.content;
                     const reuseVideoNode = sourceNode?.type === CanvasNodeType.Video && (overwriteExisting || isEmptyVideoNode);
                     const videoId = reuseVideoNode ? nodeId : nanoid();
+                    // 幂等键种子：每次"生成"动作一个新值，随节点持久化（见 buildVideoJobIdempotencyKey）。
+                    const videoJobKey = nanoid();
                     const parent = sourceNode?.position || { x: 0, y: 0 };
                     const videoNode: CanvasNodeData = {
                         id: videoId,
@@ -2763,6 +2792,7 @@ function InfiniteCanvasPage() {
                             watermark: generationConfig.videoWatermark,
                             videoMode: generationConfig.videoMode,
                             references: generationReferenceUrls(generationContext),
+                            jobKey: videoJobKey,
                         },
                     };
                     pendingChildIds = [videoId];
@@ -2774,7 +2804,7 @@ function InfiniteCanvasPage() {
                     if (!reuseVideoNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: videoId }]);
                     const controller = startGenerationRequest(videoId, nodeId, nodeId, runController);
                     try {
-                        await completeVideoNodeTask(videoId, generationConfig, effectivePrompt, generationContext.referenceImages, controller.signal, {
+                        await runVideoJobForNode(videoId, generationConfig, effectivePrompt, generationContext.referenceImages, videoJobKey, controller.signal, {
                             size: generationConfig.size,
                             seconds: generationConfig.videoSeconds,
                             vquality: generationConfig.vquality,
@@ -2782,7 +2812,7 @@ function InfiniteCanvasPage() {
                             watermark: generationConfig.videoWatermark,
                             videoMode: generationConfig.videoMode,
                             references: generationReferenceUrls(generationContext),
-                        }, generationContext.referenceVideos, generationContext.referenceAudios);
+                        });
                     } finally {
                         finishGenerationRequest(videoId, controller);
                     }
@@ -2794,6 +2824,8 @@ function InfiniteCanvasPage() {
                     const isEmptyAudioNode = sourceNode?.type === CanvasNodeType.Audio && !sourceNode.metadata?.content;
                     const reuseAudioNode = sourceNode?.type === CanvasNodeType.Audio && (overwriteExisting || isEmptyAudioNode);
                     const audioId = reuseAudioNode ? nodeId : nanoid();
+                    // 幂等键种子：每次"生成"动作一个新值（见 buildAudioJobIdempotencyKey）。
+                    const audioJobKey = nanoid();
                     const parent = sourceNode?.position || { x: 0, y: 0 };
                     const audioNode: CanvasNodeData = {
                         id: audioId,
@@ -2802,7 +2834,7 @@ function InfiniteCanvasPage() {
                         position: reuseAudioNode ? sourceNode.position : { x: parent.x + (sourceNode?.width || spec.width) + 96, y: parent.y + ((sourceNode?.height || spec.height) - spec.height) / 2 },
                         width: reuseAudioNode ? sourceNode.width : spec.width,
                         height: reuseAudioNode ? sourceNode.height : spec.height,
-                        metadata: { prompt: effectivePrompt, status: NODE_STATUS_LOADING, ...buildAudioGenerationMetadata(generationConfig) },
+                        metadata: { prompt: effectivePrompt, status: NODE_STATUS_LOADING, jobKey: audioJobKey, ...buildAudioGenerationMetadata(generationConfig) },
                     };
                     pendingChildIds = [audioId];
                     setNodes((prev) =>
@@ -2813,8 +2845,7 @@ function InfiniteCanvasPage() {
                     if (!reuseAudioNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: audioId }]);
                     const controller = startGenerationRequest(audioId, nodeId, nodeId, runController);
                     try {
-                        const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, effectivePrompt, { signal: controller.signal }), generationConfig.audioFormat);
-                        setNodes((prev) => prev.map((node) => (node.id === audioId ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: effectivePrompt, ...buildAudioGenerationMetadata(generationConfig) } } : node)));
+                        await runAudioJobForNode(audioId, generationConfig, effectivePrompt, audioJobKey, controller.signal);
                     } finally {
                         finishGenerationRequest(audioId, controller);
                     }
@@ -2951,7 +2982,6 @@ function InfiniteCanvasPage() {
                                           ...node.metadata,
                                           status: NODE_STATUS_ERROR,
                                           errorDetails,
-                                          ...(isVideoTaskFailed(error) && node.type === CanvasNodeType.Video ? { videoTaskId: undefined } : {}),
                                       },
                                   }
                             : node,
@@ -2962,7 +2992,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [applyImageItem, completeVideoNodeTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, startGenerationRequest, t],
+        [applyImageItem, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, runAudioJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2970,10 +3000,6 @@ function InfiniteCanvasPage() {
 
     const handleRetryNode = useCallback(
         async (node: CanvasNodeData, imageId?: string) => {
-            if (hasResumableVideoTask(node)) {
-                await pollVideoNodeTask(node);
-                return;
-            }
             const sourceNode = findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current) || node;
             const savedImageMetadata = node.type === CanvasNodeType.Image ? node.metadata : undefined;
             const hasSavedImageMetadata = Boolean(savedImageMetadata?.generationType);
@@ -3031,19 +3057,20 @@ function InfiniteCanvasPage() {
                     return;
                 }
                 if (node.type === CanvasNodeType.Video) {
-                    await completeVideoNodeTask(node.id, generationConfig, prompt, retryImages, controller.signal, {
+                    // 重试也是一次新的生成动作，所以换一个新的幂等键种子，
+                    // 否则会命中上一次那个已失败的 job，永远拿不到新结果。
+                    await runVideoJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal, {
                         size: generationConfig.size,
                         seconds: generationConfig.videoSeconds,
                         vquality: generationConfig.vquality,
                         generateAudio: generationConfig.videoGenerateAudio,
                         watermark: generationConfig.videoWatermark,
                         videoMode: generationConfig.videoMode,
-                    }, context?.referenceVideos || [], context?.referenceAudios || []);
+                    });
                     return;
                 }
                 if (node.type === CanvasNodeType.Audio) {
-                    const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, prompt, { signal: controller.signal }), generationConfig.audioFormat);
-                    setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(generationConfig) } } : item)));
+                    await runAudioJobForNode(node.id, generationConfig, prompt, nanoid(), controller.signal);
                     return;
                 }
 
@@ -3108,7 +3135,6 @@ function InfiniteCanvasPage() {
                                       status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
                                       errorDetails: item.metadata?.content ? undefined : errorDetails,
                                       images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)),
-                                      ...(isVideoTaskFailed(error) && item.type === CanvasNodeType.Video ? { videoTaskId: undefined } : {}),
                                   },
                               }
                             : item,
@@ -3119,7 +3145,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [completeVideoNodeTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, pollVideoNodeTask, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runAudioJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {

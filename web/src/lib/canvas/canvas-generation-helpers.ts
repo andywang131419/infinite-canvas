@@ -123,10 +123,6 @@ export function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | u
     };
 }
 
-export function hasResumableVideoTask(node: CanvasNodeData) {
-    return node.type === CanvasNodeType.Video && Boolean(node.metadata?.videoTaskId) && !node.metadata?.content;
-}
-
 /**
  * 把上次进程里没跑完的 `loading` 节点标成"已中断"。
  *
@@ -134,11 +130,15 @@ export function hasResumableVideoTask(node: CanvasNodeData) {
  *   未完成任务，标成 error 就等于告诉用户"失败了"，而任务其实还在跑、结果回来
  *   也无处写回。调用方负责先查 `GET /api/jobs?open=true` 再传进来。
  *   查不到任务时传空集合，行为与改动前完全一致。
+ *
+ * 阶段 2 之前这里还有一条 `hasResumableVideoTask(node)` 的豁免：视频任务 id
+ * 存在浏览器里，刷新后靠它去上游续轮询。视频改走服务端队列后，这份"本地双轨"
+ * 已经没有意义（服务端才是权威），故删除 —— 留着会让人以为还有第二套恢复机制。
  */
 export function resetInterruptedGeneration(nodes: CanvasNodeData[], skipNodeIds: ReadonlySet<string> = new Set()) {
     return nodes.map((node) =>
         node.metadata?.status === "loading"
-            ? hasResumableVideoTask(node) || skipNodeIds.has(node.id)
+            ? skipNodeIds.has(node.id)
                 ? node
                 : {
                       ...node,

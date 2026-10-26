@@ -59,10 +59,6 @@ export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGe
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
 
-export function isVideoTaskFailed(error: unknown) {
-    return error instanceof Error && error.name === "VideoTaskFailed";
-}
-
 function videoTaskFailed(message: string) {
     const error = new Error(message);
     error.name = "VideoTaskFailed";

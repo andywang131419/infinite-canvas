@@ -92,6 +92,39 @@ export function fetchStoredMediaBlob(storageKey: string): Promise<Blob | null> {
     return fetchStoredAssetBlob(storageKey, () => store.getItem<Blob>(storageKey));
 }
 
+/**
+ * 把**服务端已落盘**的媒体读回成 `UploadedFile`（T04-B 阶段 2）。
+ *
+ * 生成搬到服务端队列后，前端拿到的只是 `video:` / `audio:` storageKey，
+ * 而写回节点需要 `url` + `bytes` + `mimeType` + 宽高/时长。这里不重新上传，
+ * 只回读字节并解码元数据 —— 重新上传会把一份刚从服务端下来的文件再传上去。
+ *
+ * @param storageKey `video:xxx` / `audio:xxx`
+ * @param fallbackMime 字节取不到时的兜底类型（节点至少要有个能播放的 mime）
+ */
+export async function describeStoredFile(storageKey: string, fallbackMime = ""): Promise<UploadedFile> {
+    const url = await resolveMediaUrl(storageKey);
+    const blob = await fetchStoredMediaBlob(storageKey);
+    const mimeType = blob?.type || fallbackMime;
+    const meta = await readMediaMeta(blob, mimeType);
+    return { url, storageKey, bytes: blob?.size ?? 0, mimeType: mimeType || "application/octet-stream", ...meta };
+}
+
+/** 按 mime 解出宽高/时长；解码失败时静默返回空对象（尺寸只影响节点初始大小）。 */
+async function readMediaMeta(blob: Blob | null, mimeType: string): Promise<{ width?: number; height?: number; durationMs?: number }> {
+    if (!blob) return {};
+    const localUrl = URL.createObjectURL(blob);
+    try {
+        if (mimeType.startsWith("video/")) return await readVideoMeta(localUrl);
+        if (mimeType.startsWith("audio/")) return await readAudioMeta(localUrl);
+        return {};
+    } catch {
+        return {};
+    } finally {
+        URL.revokeObjectURL(localUrl);
+    }
+}
+
 export async function setMediaBlob(storageKey: string, blob: Blob) {
     await store.setItem(storageKey, blob);
     const localUrl = URL.createObjectURL(blob);

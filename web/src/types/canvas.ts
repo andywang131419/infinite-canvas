@@ -87,16 +87,23 @@ export type CanvasNodeMetadata = {
     mimeType?: string;
     bytes?: number;
     durationMs?: number;
-    videoTaskId?: string;
-    videoTaskProvider?: "openai" | "gemini";
     /**
      * 服务端任务 id（T04-B）。
      *
-     * 节点级只是**归组键**：一次生成 N 张图时，真正的 jobId 记在每张图的
-     * `images[].jobId` 上（见 `CanvasNodeImage.jobId`）；这里存的是本节点最近
-     * 一次提交的任务，用于快速判断"这个节点有没有在跑的活"。
+     * 一次生成 N 张图时，真正的 jobId 记在每张图的 `images[].jobId` 上
+     * （见 `CanvasNodeImage.jobId`）；这里存的是本节点最近一次提交的任务，
+     * 用于"停止生成"时精确取消、以及快速判断这个节点有没有在跑的活。
      */
     jobId?: string;
+    /**
+     * 幂等键种子（T04-B 阶段 2）。
+     *
+     * 音频/视频节点一次只出一个结果，没有 `images[].id` 那样的子项 id 可用，
+     * 所以每次生成动作另起一个种子，组成 `${nodeId}:${jobKey}`。
+     * **不能只用 nodeId**：服务端幂等不看任务是否已终态，只用 nodeId 会让
+     * "重新生成"拿回上一次已完成的 job，用户以为重生成了、出来的还是旧的。
+     */
+    jobKey?: string;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };
