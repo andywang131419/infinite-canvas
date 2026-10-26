@@ -406,21 +406,13 @@ function InfiniteCanvasPage() {
     }, []);
 
     /**
-     * 任务结果该写回哪张图。真正的判定在 `resolveImageWriteTarget`（可单测），
-     * 这里只取"批量图里那张"的 id；单图节点返回空串，交给调用方写节点本身。
+     * 把服务端还在跑的生成任务**接回**画布（image / audio / video）。
      *
-     * `nodes` 必须由调用方显式传入，**不能**在这里读 `nodesRef.current`：
+     * 写回落点一律由 `resolveImageWriteTarget`（job-utils，可单测）判定。
+     * 判定要的 `nodes` **必须由调用方显式传入，不能读 `nodesRef.current`**：
      * ref 是在 `useLayoutEffect` 里同步的（第 709 行），而恢复发生在 `restore()` 里
      * `setNodes` 之后、重渲染之前 —— 那时 ref 还是上一个画布的内容，
-     * 按它找图会把结果写进根本不存在的 imageId，或者退化成空串。
-     */
-    const pickImageIdForJob = useCallback((job: JobDto, nodes: CanvasNodeData[]) => {
-        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
-        return target?.kind === "image" ? target.imageId : "";
-    }, []);
-
-    /**
-     * 把服务端还在跑的生成任务**接回**画布（image / audio / video）。
+     * 按它找图会把结果写进根本不存在的 imageId。
      *
      * 只做两件事：轮询 + 写回。绝不重新提交 —— 重新提交就是重复调上游、重复扣费。
      *
@@ -438,12 +430,15 @@ function InfiniteCanvasPage() {
                     const signal = controller.signal;
                     /** 失败落点：图像能定位到具体某张就只标那张，否则整节点标红。 */
                     const reportFailure = (errorDetails: string) => {
-                        const imageId = isImageJobType(job.type) ? pickImageIdForJob(job, nodes) : "";
-                        if (imageId) {
-                            markImageError(job.nodeId, imageId, errorDetails);
+                        if (!isImageJobType(job.type)) {
+                            setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
                             return;
                         }
-                        setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
+                        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+                        // 每张图都已经是 success 时没有安全落点：任务失败了，但画布上
+                        // 的好图一张都不能动 —— 连标红都不标（标红会让用户以为好图坏了）。
+                        if (target?.kind === "image") markImageError(job.nodeId, target.imageId, errorDetails);
+                        else if (target?.kind === "node") setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
                     };
                     try {
                         const finished = await waitForJob(job.id, { signal });
@@ -467,6 +462,9 @@ function InfiniteCanvasPage() {
                         const storageKey = firstImageStorageKey(finished.resultStorageKeys);
                         if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
                         const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+                        // 没有安全落点（每张图都已经是 success）：这次结果只能丢掉。
+                        // 覆盖一张已经生成好的图是不可逆的数据丢失，而少写一张可以重试。
+                        if (target?.kind === "skip") return;
                         if (!target) throw new Error(t("canvas.projectPage.generationFailed"));
                         const described = await describeStoredImage(storageKey, { signal });
                         // 次级入口（局部重绘 / 多角度 / 内置面板写回 / 重试）的结果落在
@@ -507,7 +505,7 @@ function InfiniteCanvasPage() {
                 })();
             }
         },
-        [applyImageItem, markImageError, pickImageIdForJob, t],
+        [applyImageItem, markImageError, t],
     );
 
     /**
@@ -582,10 +580,13 @@ function InfiniteCanvasPage() {
      * 写回交给调用方 —— 每个入口的落点不同（有的是 `metadata.content`，
      * 有的是 `images[]` 里的某一张），在这里统一写会写错地方。
      *
+     * @param imageId 结果要落到 `images[]` 里的哪一张（批量图的重试场景）。给了就把
+     *   `jobId` 一并盖到那张图上，与主流程保持一致 —— 恢复时靠它精确匹配，
+     *   否则只能靠"哪个槽位还在 loading"去猜。
      * @returns 已上传好的图片（url / storageKey / 宽高 / 字节 / mime）
      */
     const runImageJobForNode = useCallback(
-        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, references: ReferenceImage[], jobKey: string, signal: AbortSignal) => {
+        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, references: ReferenceImage[], jobKey: string, signal: AbortSignal, imageId?: string) => {
             const referenceStorageKeys = await resolveReferenceStorageKeys(references, signal);
             const { job } = await createJob(
                 {
@@ -607,7 +608,15 @@ function InfiniteCanvasPage() {
                 },
                 signal,
             );
-            setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, jobId: job.id, jobKey } } : item)));
+            setNodes((prev) =>
+                prev.map((item) => {
+                    if (item.id !== nodeId) return item;
+                    // 批量图：jobId 也要落到具体那张上。只写节点级的话，恢复时精确匹配
+                    // 找不到，只能退化到"哪个槽位还在 loading"去猜 —— 猜错就覆盖好图。
+                    const images = imageId ? item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, jobId: job.id } : image)) : item.metadata?.images;
+                    return { ...item, metadata: { ...item.metadata, jobId: job.id, jobKey, ...(imageId ? { images } : {}) } };
+                }),
+            );
             const finished = await waitForJob(job.id, { signal });
             if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
             const storageKey = firstImageStorageKey(finished.resultStorageKeys);
@@ -3138,10 +3147,11 @@ function InfiniteCanvasPage() {
 
                 // 重试是一次**新的**生成动作：换新 jobKey，否则幂等键命中上一次那个
                 // 已失败的 job，界面转一圈出来还是同一条错误。
-                const uploadedImage = await runImageJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal);
+                const retryImageId = imageId || node.metadata?.primaryImageId || nanoid();
+                const uploadedImage = await runImageJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal, imageId ? retryImageId : undefined);
                 const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
                 const retryImage: CanvasNodeImage = {
-                    id: imageId || node.metadata?.primaryImageId || nanoid(),
+                    id: retryImageId,
                     status: NODE_STATUS_SUCCESS,
                     content: uploadedImage.url,
                     storageKey: uploadedImage.storageKey,
@@ -3174,7 +3184,9 @@ function InfiniteCanvasPage() {
                             metadata: {
                                 ...item.metadata,
                                 ...(makePrimary ? imageMetadata(uploadedImage) : { status: NODE_STATUS_SUCCESS }),
-                                images: item.metadata?.images?.map((current) => (current.id === retryImage.id ? retryImage : current)),
+                                // 合并而不是整体替换：`runImageJobForNode` 已经把 jobId 盖到这张上了，
+                                // 整体替换会把它冲掉，恢复时又只能靠猜。
+                                images: item.metadata?.images?.map((current) => (current.id === retryImage.id ? { ...current, ...retryImage } : current)),
                                 primaryImageId: makePrimary ? retryImage.id : item.metadata?.primaryImageId,
                                 prompt,
                                 ...generationMetadata,

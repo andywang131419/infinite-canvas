@@ -161,6 +161,11 @@ export type ImageWriteTarget =
     | { kind: "image"; imageId: string }
     /** 单图节点（局部重绘 / 多角度 / 内置面板写回 / 重试）：写到节点本身。 */
     | { kind: "node" }
+    /**
+     * 有 `images[]` 但**没有安全落点**（最常见：每一张都已经 success）：
+     * 调用方必须**什么都不写**，不能退化成"写第一张"。
+     */
+    | { kind: "skip" }
     /** 节点都找不到了 —— 调用方只能放弃写回。 */
     | null;
 
@@ -174,14 +179,24 @@ type WriteTargetNode = {
 /**
  * 图像任务的结果该写回哪里。
  *
- * 判定顺序：按 `jobId` 精确匹配 → 第一个还在 loading 且没认领的空位 →
- * 第一张。三种都没命中说明这个节点**没有** `images[]`，那就是单图节点，
- * 结果要写到 `metadata.content`。
+ * 判定顺序（**越靠前越可信**）：
+ *   1. `jobId` 精确匹配 —— 这张图就是为这个任务建的
+ *   2. 还在 `loading` 的空位
+ *   3. `error` 的空位 —— 重试的目标本来就是它
+ *   4. 状态为空 / `idle` 的空位
+ *   5. 以上都没有 → `skip`
  *
- * 最后这条是阶段 3 补的：次级入口（局部重绘 / 多角度 / 内置面板写回）建的
- * 节点没有 `images[]`，原来的实现强制要求 imageId，拿不到就抛错 —— 于是
- * 刷新后这些任务会被**错标成失败**，而服务端其实已经生成好了、钱也花了，
- * 用户只看到一句红字。
+ * **第 2 条刻意不看槽位上有没有旧 jobId。** 批量生成 4 张、第 3 张失败时，
+ * 那个槽位会留着上次失败任务的 id；单张重试后刷新，精确匹配按新 jobId 找不到
+ * （槽位上还是旧的），如果再要求 `!image.jobId`，这个槽位就被跳过、兜底到
+ * `images[0]` —— **重试出来的图会覆盖第 1 张已经成功的图**：钱花两次，好图
+ * 还被冲掉。陈旧 jobId 属于那个已经结束的任务，不该阻止新的认领。
+ *
+ * **兜底绝不能落到 `success` 的槽位上。** 宁可 `skip`（什么都不写、让用户
+ * 看到失败），也绝不能冲掉已经生成好的图 —— 覆盖成功结果是不可逆的数据丢失，
+ * 而"少写一张"是可以重试的。
+ *
+ * 没有 `images[]` 就是单图节点（次级入口建的），结果写节点本身。
  *
  * @param job 待写回的任务（需要 `id` 做精确匹配）
  * @param node 任务所属节点，找不到就传 undefined
@@ -189,15 +204,21 @@ type WriteTargetNode = {
 export function resolveImageWriteTarget(job: { id?: string } | null | undefined, node: WriteTargetNode): ImageWriteTarget {
     if (!node) return null;
     const images = node.metadata?.images || [];
+    // 单图节点：结果落在 `metadata.content`，不走 images[]。
     if (!images.length) return { kind: "node" };
+
     const jobId = job?.id;
     const matched = jobId ? images.find((image) => image.jobId === jobId) : undefined;
     if (matched?.id) return { kind: "image", imageId: matched.id };
-    // 认领过 jobId 的空位说明已经有别的任务在写了，不能抢。
-    const pending = images.find((image) => image.status === "loading" && !image.jobId);
-    if (pending?.id) return { kind: "image", imageId: pending.id };
-    const first = images[0];
-    return first?.id ? { kind: "image", imageId: first.id } : { kind: "node" };
+
+    // 剩下的顺序就是"这个槽位还能不能安全地接一张新图"。
+    for (const status of ["loading", "error", "idle", undefined, null]) {
+        const slot = images.find((image) => image.status === status);
+        if (slot?.id) return { kind: "image", imageId: slot.id };
+    }
+    // 走到这里说明每张图都已经是 success（或其它未知状态）：
+    // 没有安全落点，什么都不写。
+    return { kind: "skip" };
 }
 
 /**

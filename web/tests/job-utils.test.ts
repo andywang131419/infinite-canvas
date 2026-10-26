@@ -129,18 +129,63 @@ describe("结果写回落点（阶段 3）", () => {
         expect(resolveImageWriteTarget({ id: "job_2" }, node)).toEqual({ kind: "image", imageId: "img_2" });
     });
 
-    it("匹配不到就认领第一个还在 loading、且没被别的任务认领过的空位", () => {
+    // ── P0：下面两条是"重试会覆盖已成功的好图"的回归锁 ──────────────────
+    //
+    // 真实场景：批量生成 4 张，第 3 张失败（槽位留下**陈旧 jobId**）→ 单张重试 → 刷新。
+    // 精确匹配按新 jobId 找不到（槽位上还是旧的那个）；旧实现还要求 `!image.jobId`
+    // 才认领 loading 空位，陈旧 jobId 让这个槽位被跳过 → 兜底到 images[0]
+    // → **重试出来的图覆盖第 1 张已经成功的图**：钱花两次，好图还被冲掉。
+    it("槽位持有陈旧 jobId 时，必须选中那个槽位，绝不能兜底到第一张成功图", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "success", jobId: "job_1" },
+                    { id: "img_2", status: "success", jobId: "job_2" },
+                    { id: "img_3", status: "loading", jobId: "job_old_failed" },
+                    { id: "img_4", status: "success", jobId: "job_4" },
+                ],
+            },
+        };
+        const target = resolveImageWriteTarget({ id: "job_retry" }, node);
+        expect(target).toEqual({ kind: "image", imageId: "img_3" });
+        expect(target).not.toEqual({ kind: "image", imageId: "img_1" });
+    });
+
+    it("槽位是 error 状态（重试的目标本来就是它）也照样认领", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "success", jobId: "job_1" },
+                    { id: "img_2", status: "error", jobId: "job_old_failed" },
+                ],
+            },
+        };
+        expect(resolveImageWriteTarget({ id: "job_retry" }, node)).toEqual({ kind: "image", imageId: "img_2" });
+    });
+
+    it("所有槽位都 success 且匹配不到 → skip，绝不覆盖任何一张", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "success", jobId: "job_1" },
+                    { id: "img_2", status: "success", jobId: "job_2" },
+                ],
+            },
+        };
+        // 覆盖一张已经生成好的图是不可逆的数据丢失；少写一张可以重试。
+        expect(resolveImageWriteTarget({ id: "job_orphan" }, node)).toEqual({ kind: "skip" });
+    });
+
+    it("没有 loading/error 空位、但有 idle 空位时可以认领 idle", () => {
         const node = {
             metadata: {
                 images: [
                     { id: "img_1", status: "success" },
-                    { id: "img_2", status: "loading", jobId: "job_9" },
-                    { id: "img_3", status: "loading" },
+                    { id: "img_2", status: "idle" },
                 ],
             },
         };
-        // img_2 已经被 job_9 认领了，不能抢 —— 抢了就是两个任务写同一张图。
-        expect(resolveImageWriteTarget({ id: "job_new" }, node)).toEqual({ kind: "image", imageId: "img_3" });
+        expect(resolveImageWriteTarget({ id: "job_new" }, node)).toEqual({ kind: "image", imageId: "img_2" });
     });
 
     it("节点都不存在了就返回 null，交给调用方放弃写回", () => {
