@@ -607,7 +607,9 @@ function InfiniteCanvasPage() {
      * jobId（`metadata.jobId` / `images[].jobId`，随画布同步持久化），所以只要
      * 对着"还停在 loading 的节点"把它存的任务 id 直接取回来即可 —— 精确、零冗余。
      *
-     * 已经写回过的任务不会造成副作用：写回落点判定此时会落到 `skip`，什么都不写。
+     * 万一取回来的是**已经写回过**的任务（节点因为防抖还没同步），也不会出事：
+     * 它走的是 jobId **精确命中**分支，重写的是同一张图、同一份数据，幂等无害。
+     * 真正"什么都不写"的是 `skip`，那条要等所有槽位都 success 才会出现。
      */
     const fetchFinishedButUnclaimedJobs = useCallback(async (nodes: CanvasNodeData[], knownJobIds: Set<string>) => {
         const candidates = new Set<string>();
@@ -3219,9 +3221,14 @@ function InfiniteCanvasPage() {
                 return;
             }
             const retryImages = retryReferenceImages || [];
+            // 目标槽位在这里就算出来（而不是等到写回时）：节点级重试（`handleRetryNode(node)`
+            // 不带 imageId）也要把主图那个槽位**置回 loading 并把 jobId 落上去**。
+            // 否则这个槽位一直停在 success，刷新后恢复逻辑找不到匹配也找不到 loading
+            // 空位 → `skip` → 服务端已经生成好的图被丢掉，钱花了看不到图。
+            const retryImageId = imageId || node.metadata?.primaryImageId || nanoid();
 
             setRunningNodeId(node.id);
-            setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined, images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_LOADING, errorDetails: undefined } : image)) } } : item)));
+            setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined, images: item.metadata?.images?.map((image) => (image.id === retryImageId ? { ...image, status: NODE_STATUS_LOADING, errorDetails: undefined } : image)) } } : item)));
             const controller = startGenerationRequest(node.id, sourceNode.id, node.id);
 
             try {
@@ -3260,8 +3267,9 @@ function InfiniteCanvasPage() {
 
                 // 重试是一次**新的**生成动作：换新 jobKey，否则幂等键命中上一次那个
                 // 已失败的 job，界面转一圈出来还是同一条错误。
-                const retryImageId = imageId || node.metadata?.primaryImageId || nanoid();
-                const uploadedImage = await runImageJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal, imageId ? retryImageId : undefined);
+                // 无论是否指定了 imageId，都把目标槽位告诉提交函数：jobId 要落到那张上，
+                // 恢复时才能精确匹配，而不是靠"哪个槽位还在 loading"去猜。
+                const uploadedImage = await runImageJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal, retryImageId);
                 const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
                 const retryImage: CanvasNodeImage = {
                     id: retryImageId,
@@ -3299,7 +3307,9 @@ function InfiniteCanvasPage() {
                                 ...(makePrimary ? imageMetadata(uploadedImage) : { status: NODE_STATUS_SUCCESS }),
                                 // 合并而不是整体替换：`runImageJobForNode` 已经把 jobId 盖到这张上了，
                                 // 整体替换会把它冲掉，恢复时又只能靠猜。
-                                images: item.metadata?.images?.map((current) => (current.id === retryImage.id ? { ...current, ...retryImage } : current)),
+                                // `errorDetails: undefined` 必须显式写：合并会把上一轮失败的
+                                // 文案留在这张已经成功的图上，用户看到一张好图挂着红字。
+                                images: item.metadata?.images?.map((current) => (current.id === retryImage.id ? { ...current, ...retryImage, errorDetails: undefined } : current)),
                                 primaryImageId: makePrimary ? retryImage.id : item.metadata?.primaryImageId,
                                 prompt,
                                 ...generationMetadata,
