@@ -383,6 +383,7 @@ export default {
         },
         proxy: {
             title: "Local proxy",
+            replacedNotice: "Provider requests now go through the server's /api/proxy (the server injects keys and enforces the host allowlist), so this is no longer required. It is kept only for legacy settings and self-hosted gateway setups.",
             description: "Forward provider requests (models, image, video, text, audio) and WebDAV sync through a proxy running on your machine to avoid browser CORS errors.",
             startHint: "Run this in a terminal first, and keep it running while you use the canvas:",
             address: "Proxy address",

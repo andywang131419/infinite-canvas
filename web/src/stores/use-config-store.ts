@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { fetchChannelHints, pushChannelSecret } from "@/services/channel-secrets";
 
 export type ApiCallFormat = "openai" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
@@ -19,7 +20,10 @@ export type ModelChannel = {
     id: string;
     name: string;
     baseUrl: string;
+    /** 明文密钥。**T04-A6 起只写**：填进来就推服务端加密存储，然后立刻清成 `""`。 */
     apiKey: string;
+    /** 服务端返回的掩码提示（`sk-****abcd`），用于展示"已配置"与让用户确认是哪把 key。 */
+    apiKeyHint?: string;
     apiFormat: ApiCallFormat;
     models: ChannelModel[];
 };
@@ -27,7 +31,10 @@ export type ModelChannel = {
 export type AiConfig = {
     channelMode: "remote" | "local";
     baseUrl: string;
+    /** 同 `ModelChannel.apiKey`：只写、不持久化。 */
     apiKey: string;
+    /** 服务端掩码提示（老版本顶层单渠道场景用）。 */
+    apiKeyHint?: string;
     apiFormat: ApiCallFormat;
     channels: ModelChannel[];
     model: string;
@@ -143,6 +150,13 @@ type ConfigStore = {
     shouldPromptContinue: boolean;
     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
     importChannelCredentials: (input: { baseUrl?: string | null; apiKey?: string | null }) => ChannelCredentialsImportResult;
+    /**
+     * 保存渠道列表（T04-A6）。
+     *
+     * 与直接 `updateConfig("channels", ...)` 的区别：这里会**先把明文密钥推给服务端**，
+     * 拿到掩码后把本地 `apiKey` 清空再落库。所有改渠道的入口都必须走它。
+     */
+    persistChannels: (channels: ModelChannel[]) => Promise<void>;
     updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
     isAiConfigReady: (config: AiConfig, model: string) => boolean;
     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
@@ -207,9 +221,138 @@ export function resolveModelScript(config: AiConfig, value: string) {
     return findChannelModel(config, value)?.model.script?.trim() || "";
 }
 
+/**
+ * 这个渠道是否"已配置密钥"。
+ *
+ * T04-A6 起明文密钥不再落 localStorage，因此判断依据有两个：
+ * - `apiKey` 非空（用户刚在输入框里填了、还没来得及推服务端）；
+ * - `apiKeyHint` 非空（服务端确认有密钥，这里只有掩码）。
+ *
+ * 所有"能不能发请求"的前置检查都必须走这个函数，否则改造后处处误报"未配置密钥"。
+ */
+export function channelHasKey(channel: Pick<ModelChannel, "apiKey" | "apiKeyHint">): boolean {
+    return Boolean(channel.apiKey.trim() || channel.apiKeyHint);
+}
+
+// ---------------------------------------------------------------------------
+// T04-A6：密钥只写 —— 持久化剥离、老数据迁移、掩码回填
+// ---------------------------------------------------------------------------
+
+/** 一条待迁移的历史明文密钥。 */
+type LegacySecret = { name: string; baseUrl: string; apiFormat: ApiCallFormat; models: ChannelModel[]; apiKey: string };
+
+/** 从 localStorage 残值里抠出来、还没成功推到服务端的密钥（进程内队列，重启会再生成）。 */
+const pendingLegacySecrets: LegacySecret[] = [];
+
+/** 剔除所有明文密钥（`partialize` 专用）。 */
+function stripSecrets(config: AiConfig): AiConfig {
+    return {
+        ...config,
+        apiKey: "",
+        channels: config.channels.map((channel) => ({ ...channel, apiKey: "" })),
+    };
+}
+
+/** 把渠道列表写回 config（同步刷新 models / 顶层 baseUrl / 各能力默认模型）。 */
+function applyChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
+    const next: AiConfig = {
+        ...config,
+        channels,
+        models: modelOptionsFromChannels(channels),
+        baseUrl: channels[0]?.baseUrl || config.baseUrl,
+        apiFormat: channels[0]?.apiFormat || config.apiFormat,
+    };
+    return {
+        ...next,
+        imageModel: pickDefaultModel(next, "image", config.imageModel),
+        videoModel: pickDefaultModel(next, "video", config.videoModel),
+        textModel: pickDefaultModel(next, "text", config.textModel),
+        audioModel: pickDefaultModel(next, "audio", config.audioModel),
+    };
+}
+
+/** 当前选中的模型不在新渠道里时，退回到该能力的第一个可用模型。 */
+function pickDefaultModel(config: AiConfig, capability: ModelCapability, current: string): string {
+    const options = selectableModelsByCapability(config, capability);
+    const normalized = normalizeModelOptionValue(current, config.channels);
+    return options.includes(normalized) ? normalized : options[0] || "";
+}
+
+/** 从持久化残值里收集明文密钥（`merge` 期间调用一次）。 */
+function queueLegacySecrets(persisted: Partial<AiConfig>): void {
+    const channels = Array.isArray(persisted.channels) ? persisted.channels : [];
+    for (const channel of channels) {
+        const apiKey = (channel?.apiKey ?? "").trim();
+        const baseUrl = (channel?.baseUrl ?? "").trim();
+        if (!apiKey || !baseUrl) continue;
+        pendingLegacySecrets.push({
+            name: channel.name || i18n.t("config.channels.defaultName"),
+            baseUrl,
+            apiFormat: normalizeApiFormat(channel.apiFormat),
+            models: normalizeChannelModels(channel.models),
+            apiKey,
+        });
+    }
+
+    // 老版本没有 channels 数组，只有顶层 baseUrl + apiKey。
+    const topLevelKey = (persisted.apiKey ?? "").trim();
+    const topLevelBaseUrl = (persisted.baseUrl ?? "").trim();
+    if (topLevelKey && topLevelBaseUrl) {
+        pendingLegacySecrets.push({
+            name: i18n.t("config.channels.defaultName"),
+            baseUrl: topLevelBaseUrl,
+            apiFormat: normalizeApiFormat(persisted.apiFormat),
+            models: [],
+            apiKey: topLevelKey,
+        });
+    }
+}
+
+/** 拉一次服务端掩码并回填到本地渠道（按 baseUrl 匹配；回填不会覆盖用户刚输入的明文）。 */
+export async function refreshChannelHints(): Promise<void> {
+    try {
+        const hints = await fetchChannelHints();
+        useConfigStore.setState((state) => ({
+            config: {
+                ...state.config,
+                channels: state.config.channels.map((channel) => {
+                    const hint = hints[channel.baseUrl.trim()];
+                    return hint ? { ...channel, apiKeyHint: hint } : channel;
+                }),
+                ...(hints[state.config.baseUrl.trim()] ? { apiKeyHint: hints[state.config.baseUrl.trim()] } : {}),
+            },
+        }));
+    } catch {
+        // 后端不可达：掩码只是展示用，缺了不影响生成。
+    }
+}
+
+/**
+ * 迁移历史明文密钥到服务端（幂等）。
+ *
+ * 成功推上去的那些不会丢；失败的原样留在内存队列里，下次启动 `merge` 会重新生成队列再试。
+ * **无论如何明文都不会被写回 localStorage** —— `partialize` 已经把它剔掉了。
+ */
+export async function flushLegacySecrets(): Promise<void> {
+    if (pendingLegacySecrets.length === 0) return;
+    const batch = pendingLegacySecrets.splice(0, pendingLegacySecrets.length);
+    const leftovers: LegacySecret[] = [];
+    let migrated = 0;
+    for (const entry of batch) {
+        try {
+            await pushChannelSecret(entry);
+            migrated += 1;
+        } catch {
+            leftovers.push(entry);
+        }
+    }
+    pendingLegacySecrets.push(...leftovers);
+    if (migrated > 0) await refreshChannelHints();
+}
+
 function isAiConfigReady(config: AiConfig, model: string) {
     const match = findChannelModel(config, model);
-    return Boolean(match && match.channel.baseUrl.trim() && match.channel.apiKey.trim());
+    return Boolean(match && match.channel.baseUrl.trim() && channelHasKey(match.channel));
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -230,8 +373,47 @@ export const useConfigStore = create<ConfigStore>()(
             importChannelCredentials: (input) => {
                 const currentConfig = get().config;
                 const result = upsertChannelCredentials(currentConfig, input);
-                if (result.config !== currentConfig) set({ config: result.config });
+                if (result.config !== currentConfig) {
+                    set({ config: result.config });
+                    // 导入的通常是明文 key（`?apiKey=` 链接）：立刻推服务端并擦掉本地明文，
+                    // 否则 `partialize` 会把它从磁盘剔除，刷新后就永久丢了。
+                    const hasPlaintext = result.config.channels.some((channel) => channel.apiKey.trim());
+                    if (hasPlaintext) void get().persistChannels(result.config.channels);
+                }
                 return { status: result.status, channelName: result.channelName };
+            },
+            /**
+             * 保存渠道列表（T04-A6）。
+             *
+             * 顺序很重要：**先推送明文密钥 → 拿到掩码 → 再清空本地明文**。
+             * 反过来（先清空再推）一旦推送失败，用户的 key 就永久丢了。
+             * 推送失败时明文仍保留在内存里（`apiKey` 不为空），界面能提示"未保存成功"，
+             * 用户重试一次即可；而 `partialize` 保证它永远不会被写进 localStorage。
+             */
+            persistChannels: async (channels) => {
+                const resolved: ModelChannel[] = [];
+                for (const channel of channels) {
+                    const apiKey = channel.apiKey.trim();
+                    if (!apiKey || !channel.baseUrl.trim()) {
+                        resolved.push(channel);
+                        continue;
+                    }
+                    try {
+                        const saved = await pushChannelSecret({
+                            name: channel.name,
+                            baseUrl: channel.baseUrl,
+                            apiFormat: channel.apiFormat,
+                            models: channel.models,
+                            apiKey,
+                        });
+                        // 推送成功：明文立刻清空，只留服务端给的掩码。
+                        resolved.push({ ...channel, apiKey: "", apiKeyHint: saved.apiKeyHint || channel.apiKeyHint });
+                    } catch {
+                        // 推送失败：保留明文，让用户能重试（不写入磁盘，见 `stripSecrets`）。
+                        resolved.push(channel);
+                    }
+                }
+                set((state) => ({ config: applyChannels(state.config, resolved) }));
             },
             updateWebdavConfig: (key, value) =>
                 set((state) => ({
@@ -247,11 +429,21 @@ export const useConfigStore = create<ConfigStore>()(
         }),
         {
             name: CONFIG_STORE_KEY,
-            partialize: (state) => ({ config: state.config, webdav: state.webdav }),
+            /**
+             * 只持久化"不含密钥"的部分（T04-A6）。
+             *
+             * 密钥由服务端加密保管，前端只需要掩码 `apiKeyHint`；
+             * 把 `apiKey` 从结构里剔掉（而不是只在写入时置空）才能真正保证
+             * "老版本残留的明文再也不会被写回 localStorage"。
+             */
+            partialize: (state) => ({ config: stripSecrets(state.config), webdav: state.webdav }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
                 const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
+                // 迁移用的历史明文密钥：`persisted` 是**磁盘上的原始值**，
+                // 这里把残值抠出来排队，交给 `flushLegacySecrets()` 推到服务端后擦除。
+                queueLegacySecrets(persistedConfig);
                 const config = { ...defaultConfig, ...persistedConfig };
                 if (!Array.isArray(persistedConfig.channels)) config.channels = [];
                 const channels = normalizeChannels(config);
@@ -287,6 +479,14 @@ export const useConfigStore = create<ConfigStore>()(
                     },
                 };
             },
+            /**
+             * 水合完成后做两件事（都失败静默）：
+             * 1. 把 `merge` 期间收集到的历史明文密钥推到服务端（幂等迁移）；
+             * 2. 拉一次服务端掩码，让"已配置密钥"的提示能显示出来。
+             */
+            onRehydrateStorage: () => () => {
+                void flushLegacySecrets();
+            },
         },
     ),
 );
@@ -318,6 +518,8 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
         name: channel?.name?.trim() || i18n.t("config.channels.newName"),
         baseUrl: channel?.baseUrl?.trim() || defaultBaseUrlForApiFormat(apiFormat),
         apiKey: channel?.apiKey || "",
+        // 掩码是"服务端已有密钥"的唯一线索，任何渠道对象的派生都必须把它带上。
+        ...(channel?.apiKeyHint ? { apiKeyHint: channel.apiKeyHint } : {}),
         apiFormat,
         models: normalizeChannelModels(channel?.models),
     };
@@ -432,7 +634,7 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
-    return matched || config.channels[0] || createModelChannel({ id: "default", name: i18n.t("config.channels.defaultName"), baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
+    return matched || config.channels[0] || createModelChannel({ id: "default", name: i18n.t("config.channels.defaultName"), baseUrl: config.baseUrl, apiKey: config.apiKey, apiKeyHint: config.apiKeyHint, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
@@ -442,6 +644,8 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
         model: modelOptionName(value || config.model),
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
+        // 掩码要一起带上：调用方用 `channelHasKey` 判断"已配置"，没有它会误报未配置。
+        apiKeyHint: channel.apiKeyHint,
         apiFormat: channel.apiFormat,
     };
 }
@@ -497,11 +701,17 @@ export function normalizeLocalProxyUrl(value: string) {
     return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 }
 
-/** Prefix an outgoing request with the local forwarding proxy so the browser is not blocked by CORS. */
+/**
+ * Prefix an outgoing request with the local forwarding proxy so the browser is not blocked by CORS.
+ *
+ * **T04-A2 起已退化为恒等函数**：上游请求统一由服务端 `/api/proxy` 代发
+ * （见 `services/server-fetch.ts`），本地 canvas-proxy 不再是必需链路。
+ *
+ * 保留导出而不是删掉调用点的理由：
+ * 1. 调用点都在"拼 URL"的纯函数里，恒等实现让它们继续成立，不必一次性改十几个文件；
+ * 2. 老配置里的 `proxyEnabled` / `proxyUrl` 仍要被设置页读出来、提示"已由服务端代理取代"，
+ *    直接删字段会让老用户看到一堆失效配置而无从解释。
+ */
 export function withLocalProxy(url: string) {
-    const { proxyEnabled, proxyUrl } = useConfigStore.getState().config;
-    if (!proxyEnabled || !/^https?:\/\//i.test(url)) return url;
-    const base = normalizeLocalProxyUrl(proxyUrl);
-    if (!base || url.startsWith(`${base}/`)) return url;
-    return `${base}/${url}`;
+    return url;
 }

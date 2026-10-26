@@ -79,7 +79,13 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </label>
                 <label className="block md:col-span-2">
                     <span className="mb-1 block text-sm font-medium">API Key</span>
-                    <Input.Password value={draft.apiKey} onChange={(event) => patch({ apiKey: event.target.value })} placeholder="sk-..." />
+                    <Input.Password
+                        value={draft.apiKey}
+                        onChange={(event) => patch({ apiKey: event.target.value })}
+                        placeholder={draft.apiKeyHint ? t("config.channelEditor.apiKeyKeep", { hint: draft.apiKeyHint }) : "sk-..."}
+                    />
+                    {/* 密钥只写：填了就推服务端加密存储，本地只留掩码；留空 = 保留原密钥。 */}
+                    <span className="mt-1 block text-xs text-stone-500">{draft.apiKeyHint ? t("config.channelEditor.apiKeyConfigured", { hint: draft.apiKeyHint }) : t("config.channelEditor.apiKeyWriteOnly")}</span>
                 </label>
             </div>
 

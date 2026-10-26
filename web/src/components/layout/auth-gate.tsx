@@ -20,6 +20,7 @@
 import { useEffect, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
+import { AUTH_REQUIRED_EVENT, SETUP_REQUIRED_EVENT } from "@/services/server-api";
 import { useAuthStore } from "@/stores/use-auth-store";
 
 /** 全屏居中的加载/错误容器。 */
@@ -45,6 +46,29 @@ export function AuthGate({ children }: { children: ReactNode }) {
     useEffect(() => {
         if (!resolved) void refresh();
     }, [resolved, refresh]);
+
+    /**
+     * 监听 API 层广播的全局事件。
+     *
+     * 会话在页面开着的时候过期是常态（Cookie 到期 / 另一处改了密码）：
+     * 等到下一次路由跳转才发现，用户会先看到一堆"加载失败"。
+     * 这里收到 401 立刻刷新登录态 → 上面的分支把用户送去登录页。
+     * 403 `SETUP_REQUIRED` 同理，送去 `/setup`。
+     */
+    useEffect(() => {
+        const onAuthRequired = () => {
+            void refresh();
+        };
+        const onSetupRequired = () => {
+            useAuthStore.setState({ status: "setup", resolved: true });
+        };
+        window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+        window.addEventListener(SETUP_REQUIRED_EVENT, onSetupRequired);
+        return () => {
+            window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
+            window.removeEventListener(SETUP_REQUIRED_EVENT, onSetupRequired);
+        };
+    }, [refresh]);
 
     if (status === "loading") {
         return <CenteredPanel title="正在加载…" description="正在确认登录状态" />;

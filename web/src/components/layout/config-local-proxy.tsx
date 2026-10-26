@@ -29,6 +29,10 @@ export function ConfigLocalProxy() {
 
     return (
         <Form layout="vertical" requiredMark={false}>
+            {/* T04-A2：上游调用改由服务端 /api/proxy 代发，本地代理不再是必需链路。 */}
+            <section className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200">
+                {t("config.proxy.replacedNotice")}
+            </section>
             <section className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
