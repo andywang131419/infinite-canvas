@@ -65,6 +65,11 @@ export type JobRow = {
  *
  * 为什么 `started_at = COALESCE(started_at, ?)`：重试的任务不应该把"首次开始时间"
  * 反复刷新，否则排障时看不出真实耗时。
+ *
+ * `AND attempt < max_attempts`（QA R2 队列类 P2）：
+ * 少了它，一条 attempt 已耗尽、却因 `requeueExpired` 中途崩溃而停留在 `queued`
+ * 的任务会被再次认领，`attempt` 被加到 3/2 —— 于是用户看到"重试 3 次"而
+ * 配置写的是 2 次，上游也被多计费一次。
  */
 export const SQL_CLAIM_JOB = `
 UPDATE jobs
@@ -77,6 +82,7 @@ UPDATE jobs
      SELECT id FROM jobs
       WHERE status = 'queued'
         AND run_after <= ?
+        AND attempt < max_attempts
       ORDER BY priority DESC, created_at ASC
       LIMIT 1
  )
@@ -140,7 +146,21 @@ UPDATE jobs
 /**
  * 成功收尾。
  *
- * 参数顺序：1. result_storage_keys  2. cost_actual  3. finished_at  4. updated_at  5. id
+ * **QA R2 `P1-R2-1`（僵尸 Worker 覆盖新 Worker 的成果）**：
+ * 原来这里只有 `WHERE id = ? AND status = 'running'`，而 `status='running'`
+ * **不是 fencing token** —— 任务被 reaper 回队、又被另一个 Worker 认领之后，
+ * 状态又变回 `running`，旧 Worker 的收尾照样命中，于是：
+ *
+ *   A 认领 attempt=1 → 心跳失败 → reaper 回队 → B 认领 attempt=2
+ *   → A 僵尸收尾 changes=1，写入 image:A-STALE
+ *   → B 正常收尾 changes=0，成果被丢
+ *   → 用户看到上一次失败运行的图，attempt 被真实消耗、上游计费两次
+ *
+ * `AND attempt = ?` 才是围栏：它认的是**这一次的认领**，不是"当前是不是 running"。
+ * 两条收尾 SQL 必须一起加，漏一条就等于没加。
+ *
+ * 参数顺序：1. result_storage_keys  2. cost_actual  3. finished_at  4. updated_at
+ *           5. id  6. attempt
  */
 export const SQL_FINISH_SUCCEEDED = `
 UPDATE jobs
@@ -156,14 +176,18 @@ UPDATE jobs
        updated_at = ?
  WHERE id = ?
    AND status = 'running'
+   AND attempt = ?
 `;
 
 /**
  * 失败 / 取消收尾。
  *
+ * 同样带 `AND attempt = ?` 围栏（理由见 `SQL_FINISH_SUCCEEDED`）：
+ * 僵尸 Worker 写一次"失败 + 回队"会让 attempt 计数与退避时间都错乱。
+ *
  * 参数顺序：1. status  2. error_code  3. error_message  4. retryable
  * 5. run_after（可重试时用于退避，不可重试时写入当前时间即可）
- * 6. finished_at  7. updated_at  8. id
+ * 6. finished_at  7. updated_at  8. id  9. attempt
  */
 export const SQL_FINISH_FAILED = `
 UPDATE jobs
@@ -177,6 +201,7 @@ UPDATE jobs
        updated_at = ?
  WHERE id = ?
    AND status = 'running'
+   AND attempt = ?
 `;
 
 /** 进度上报。参数：1. progress 2. stage 3. updated_at 4. id */
@@ -194,8 +219,20 @@ UPDATE jobs SET upstream_task_id = ?, updated_at = ? WHERE id = ?
 
 // 下面几条 SQL 同样导出：`scripts/verify-t03.mjs` 会原样抽取来验证
 // 「幂等入队只写一行」「列表/取消的 WHERE 条件正确」，而不是在脚本里重写一遍。
+
+/**
+ * 按幂等键取（**限定 user_id**）。
+ *
+ * QA R2 `P1-R2-4`：原来只有 `WHERE idempotency_key = ?`，而幂等键是客户端
+ * 随便给的字符串 —— B 只要猜到/复用 A 用过的键，就能拿到 A 的任务详情，
+ * 包括 `result_storage_keys`（能直接下载 A 生成的图）、`upstream_task_id`
+ * 与 `errorMessage`。配套的 `ux_jobs_idempotency` 也缺 `user_id`
+ * （见 `migrations/0002_job_fencing.sql`），所以这里是"索引 + 查询"两边一起修。
+ *
+ * 参数顺序：1. idempotency_key  2. user_id
+ */
 export const SQL_SELECT_BY_IDEMPOTENCY = `
-SELECT * FROM jobs WHERE idempotency_key = ? LIMIT 1
+SELECT * FROM jobs WHERE idempotency_key = ? AND user_id = ? LIMIT 1
 `;
 
 export const SQL_INSERT_JOB = `
@@ -280,13 +317,35 @@ export function requeueExpired(backoffSeconds: number, now: Date = new Date()): 
     return { requeued, failed };
 }
 
-/** 标记成功。 */
-export function markSucceeded(jobId: string, storageKeys: string[], costActual: number | null, now: Date = new Date()): boolean {
+/**
+ * 标记成功。
+ *
+ * @param job 认领时的快照 —— **必须带 `attempt`**：它是这次认领的 fencing token
+ *             （`SQL_FINISH_SUCCEEDED` 的 `AND attempt = ?`），没有它就等于没围栏。
+ * @returns 是否真的写入。`false` 表示这一轮已经不是自己在跑（被取消 / 被回收 / 已被他人收尾）。
+ */
+export function markSucceeded(job: Pick<JobRow, "id" | "attempt">, storageKeys: string[], costActual: number | null, now: Date = new Date()): boolean {
     const nowIso = now.toISOString();
     const keys = storageKeys.length > 0 ? JSON.stringify(storageKeys) : null;
-    const changes = getDb().query(SQL_FINISH_SUCCEEDED).run(keys, costActual, nowIso, nowIso, jobId).changes;
+    const changes = getDb().query(SQL_FINISH_SUCCEEDED).run(keys, costActual, nowIso, nowIso, job.id, job.attempt).changes;
     return Number(changes) > 0;
 }
+
+/** 失败收尾的结果。 */
+export type MarkFailedResult = {
+    /** 写入的状态：`queued`（还能重试）或 `failed`（终态）。 */
+    status: JobStatus;
+    /** 还要等多久才会被再次认领；`null` 表示不再重试。 */
+    nextAttemptInSeconds: number | null;
+    /**
+     * 是否真的写入了这行。
+     *
+     * QA R2 队列类 P2：以前不看 `changes`，任务已被用户取消、或已被另一个 Worker
+     * 收尾时仍会打日志"X 秒后重试"—— 运维按日志去等一次永远不会发生的重试。
+     * 这里与 `markSucceeded` 统一成返回 boolean，调用方据此决定要不要说"会重试"。
+     */
+    applied: boolean;
+};
 
 /**
  * 标记失败。
@@ -300,13 +359,13 @@ export function markFailed(
     error: { code: string; message: string; retryable: boolean },
     backoffSeconds: number,
     now: Date = new Date(),
-): { status: JobStatus; nextAttemptInSeconds: number | null } {
+): MarkFailedResult {
     const canRetry = error.retryable && job.attempt < job.max_attempts;
     const nowIso = now.toISOString();
     const nextRunAfter = canRetry ? new Date(now.getTime() + backoffSeconds * 1000).toISOString() : nowIso;
     const status: JobStatus = canRetry ? "queued" : "failed";
 
-    getDb()
+    const changes = getDb()
         .query(SQL_FINISH_FAILED)
         .run(
             status,
@@ -317,9 +376,10 @@ export function markFailed(
             canRetry ? null : nowIso,
             nowIso,
             job.id,
-        );
+            job.attempt,
+        ).changes;
 
-    return { status, nextAttemptInSeconds: canRetry ? backoffSeconds : null };
+    return { status, nextAttemptInSeconds: canRetry ? backoffSeconds : null, applied: Number(changes) > 0 };
 }
 
 /** 上报进度（progress 会被夹到 [0,1]）。 */
@@ -343,9 +403,38 @@ export function findJobByIdOwned(userId: string, id: string): JobRow | null {
     return (getDb().query(SQL_SELECT_JOB_BY_ID_OWNED).get(id, userId) as JobRow | null) ?? null;
 }
 
-/** 按幂等键取。 */
-export function findJobByIdempotencyKey(key: string): JobRow | null {
-    return (getDb().query(SQL_SELECT_BY_IDEMPOTENCY).get(key) as JobRow | null) ?? null;
+/**
+ * 按幂等键取（**限定 owner**）。
+ *
+ * 必须传 `userId`：幂等键是客户端随便给的字符串，不按用户隔离就等于
+ * 「猜到别人的键就能读到别人的任务结果」（QA R2 `P1-R2-4`）。
+ */
+export function findJobByIdempotencyKey(key: string, userId: string): JobRow | null {
+    return (getDb().query(SQL_SELECT_BY_IDEMPOTENCY).get(key, userId) as JobRow | null) ?? null;
+}
+
+/**
+ * 幂等键冲突：同一用户对同一键再次提交，但既有任务属于**另一个画布**或**另一种类型**。
+ *
+ * 刻意不是 `ApiError`：本文件是数据层，不该知道 HTTP 状态码；
+ * 由 `services/job-service.ts` 翻译成 409。
+ *
+ * 为什么不能"直接返回既有任务"：前端用"请求体哈希"当幂等键，两个不同画布的
+ * 请求体完全可能一样（同一句 prompt 在两个画布各生成一次）。此时返回第一个画布的
+ * 任务，用户会在当前画布里看到永远等不到的结果。
+ */
+export class IdempotencyConflictError extends Error {
+    /** 冲突的维度。 */
+    readonly reason: "canvas_mismatch" | "type_mismatch";
+    /** 既有任务的 id（前端拿它可以跳过去看）。 */
+    readonly jobId: string;
+
+    constructor(reason: "canvas_mismatch" | "type_mismatch", jobId: string, message: string) {
+        super(message);
+        this.name = "IdempotencyConflictError";
+        this.reason = reason;
+        this.jobId = jobId;
+    }
 }
 
 /** 建任务入参。 */
@@ -377,7 +466,16 @@ export type EnqueueJobResult = { job: JobRow; created: boolean };
  * 用写事务而不是"先查后插"是因为后者在并发下会双插（虽然有唯一索引兜底，
  * 但会把异常路径变成常态路径，日志会很脏）。
  *
+ * 三道隔离（QA R2 `P1-R2-4`）：
+ * 1. `user_id` —— 幂等键按用户隔离，B 复用 A 的键会**新建**而不是读到 A 的；
+ * 2. `canvas_id` —— 同一用户对两个画布提交同一份 body，第二次是**新任务**；
+ * 3. `type` —— 同一键先建 image 再建 video，也是新任务。
+ *
+ * 2/3 命中时抛 `IdempotencyConflictError`（而不是悄悄返回另一个任务），
+ * 让调用方能明确告诉前端"这个键已经被别处用了"。
+ *
  * @returns `created=true` 表示新建；`false` 表示命中幂等键（**不得重复调用上游**）。
+ * @throws {IdempotencyConflictError} 幂等键被同一用户的另一个画布/类型占用
  */
 export function enqueueJob(input: EnqueueJobInput, now: Date = new Date()): EnqueueJobResult {
     const db = getDb();
@@ -389,8 +487,14 @@ export function enqueueJob(input: EnqueueJobInput, now: Date = new Date()): Enqu
 
     db.exec("BEGIN IMMEDIATE");
     try {
-        const existing = findJobByIdempotencyKey(idempotencyKey);
+        const existing = findJobByIdempotencyKey(idempotencyKey, input.userId);
         if (existing) {
+            if (existing.canvas_id !== input.canvasId) {
+                throw new IdempotencyConflictError("canvas_mismatch", existing.id, `幂等键已被同一用户的另一个画布占用（画布 ${existing.canvas_id}）`);
+            }
+            if (existing.type !== input.type) {
+                throw new IdempotencyConflictError("type_mismatch", existing.id, `幂等键已被同一用户的另一种任务占用（类型 ${existing.type}）`);
+            }
             db.exec("COMMIT");
             return { job: existing, created: false };
         }
@@ -399,7 +503,14 @@ export function enqueueJob(input: EnqueueJobInput, now: Date = new Date()): Enqu
         db.exec("COMMIT");
         return { job, created: true };
     } catch (error) {
-        db.exec("ROLLBACK");
+        // COMMIT 失败时事务已经结束，再 ROLLBACK 会抛
+        // "cannot rollback - no transaction is active"，把真正的错误掩盖掉。
+        // 所以回滚本身也要容错（QA R2 队列类 P2）。
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            // 忽略：这里唯一要做的就是把原始异常抛上去。
+        }
         throw error;
     }
 }

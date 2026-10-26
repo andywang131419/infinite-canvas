@@ -21,6 +21,7 @@ import {
     cancelJob,
     enqueueJob,
     findJobByIdOwned,
+    IdempotencyConflictError,
     listJobs,
     listOpenJobsByCanvas,
     type JobRow,
@@ -159,7 +160,7 @@ export function createJobForUser(user: SessionUser, body: unknown): CreatedJob {
     const params = normalizeParams(input.params);
     const capability = CAPABILITY_BY_TYPE[input.type];
 
-    const result = enqueueJob({
+    const request = {
         canvasId: input.canvasId,
         nodeId: input.nodeId,
         userId: user.id,
@@ -171,9 +172,19 @@ export function createJobForUser(user: SessionUser, body: unknown): CreatedJob {
         idempotencyKey: input.idempotencyKey ?? null,
         maxAttempts: input.maxAttempts ?? getEnv().JOB_MAX_ATTEMPTS,
         priority: input.priority ?? 0,
-    });
+    };
 
-    return { job: toJobDto(result.job), created: result.created };
+    try {
+        const result = enqueueJob(request);
+        return { job: toJobDto(result.job), created: result.created };
+    } catch (error) {
+        // 幂等键被同一用户的另一个画布/类型占用：409 而不是 200，
+        // 否则前端会拿着别的画布的任务 id 一直轮询，永远等不到结果。
+        if (error instanceof IdempotencyConflictError) {
+            throw new ApiError("IDEMPOTENCY_DUPLICATE", error.message, { jobId: error.jobId, reason: error.reason });
+        }
+        throw error;
+    }
 }
 
 /** 列表：`?canvasId=&open=true&limit=`。 */

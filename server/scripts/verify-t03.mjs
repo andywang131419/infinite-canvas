@@ -113,7 +113,19 @@ function section(title) {
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 const queueSource = readFileSync(join(repoRoot, "src/jobs/queue.ts"), "utf8");
-const migrationSql = readFileSync(join(repoRoot, "migrations/0001_init.sql"), "utf8");
+
+/**
+ * 全部迁移 SQL（按文件名升序），而不是只取 0001。
+ *
+ * `0002_job_fencing.sql` 改了幂等唯一索引并给 `backups` 加列；
+ * 只跑 0001 的话，下面"幂等键跨租户隔离"的用例会测到一个**不存在的索引**，
+ * 测过了也是假的。
+ */
+const migrationSql = (await readdir(join(repoRoot, "migrations")))
+    .filter((name) => /^\d+_.+\.sql$/.test(name))
+    .sort()
+    .map((name) => readFileSync(join(repoRoot, "migrations", name), "utf8"))
+    .join("\n");
 const channelsRouteSource = readFileSync(join(repoRoot, "src/routes/channels.ts"), "utf8");
 const channelsRepoSource = readFileSync(join(repoRoot, "src/db/repos/channels.ts"), "utf8");
 const channelServiceSource = readFileSync(join(repoRoot, "src/services/channel-service.ts"), "utf8");
@@ -246,11 +258,15 @@ function createQueueDb() {
     return { db, path };
 }
 
-/** 在同一个库文件上再开一条连接（模拟第二个 Worker 进程）。 */
+/**
+ * 在同一个库文件上再开一条连接（模拟第二个 Worker 进程）。
+ *
+ * **不重跑迁移**：第二个进程连的是同一个已迁移的库，重跑 `0002` 的
+ * `ALTER TABLE ... ADD COLUMN` 会报 duplicate column（SQLite 没有
+ * `ADD COLUMN IF NOT EXISTS`）。这也更贴近真实——迁移是启动期一次性动作。
+ */
 function openOn(path) {
-    const db = new DatabaseSync(path);
-    db.exec(migrationSql);
-    return db;
+    return new DatabaseSync(path);
 }
 
 /** 插入 jobs 的外键父行（users / canvases）。 */
@@ -463,7 +479,7 @@ check("幂等：同一 idempotencyKey 提交 3 次 → 只写 1 行", () => {
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
         db.exec("BEGIN IMMEDIATE");
-        const existing = db.prepare(SQL.selectByIdempotency).get(key);
+        const existing = db.prepare(SQL.selectByIdempotency).get(key, "user_1");
         if (existing) {
             db.exec("COMMIT");
             continue;
@@ -477,13 +493,72 @@ check("幂等：同一 idempotencyKey 提交 3 次 → 只写 1 行", () => {
     db.close();
 });
 
+// QA R2 `P1-R2-4`：幂等键跨租户返回他人任务。
+//
+// 原实现 `SELECT ... WHERE idempotency_key = ?` 没有 user_id，且唯一索引
+// `ux_jobs_idempotency` 也没有 —— 于是 B 复用 A 用过的键，拿到的就是 A 的任务
+// （含 result_storage_keys / upstream_task_id / errorMessage）。
+check("幂等隔离：B 复用 A 的幂等键 → 必须新建，不能读到 A 的任务", () => {
+    const { db } = createQueueDb();
+    const key = "shared_key";
+
+    insertJob(db, { id: "job_A", userId: "user_1", idempotencyKey: key });
+
+    // B 用同一个键提交。
+    db.exec("BEGIN IMMEDIATE");
+    const seenByB = db.prepare(SQL.selectByIdempotency).get(key, "user_2");
+    if (!seenByB) insertJob(db, { id: "job_B", userId: "user_2", idempotencyKey: key });
+    db.exec("COMMIT");
+
+    assertEqual(seenByB, undefined, "B 看到了 A 的任务（幂等键跨租户泄露）");
+
+    const rows = db.prepare("SELECT id, user_id FROM jobs WHERE idempotency_key = ?").all(key);
+    assertEqual(rows.length, 2, `同一幂等键应允许两个用户各有一行，实际 ${rows.length} 行`);
+    assert(
+        rows.some((row) => row.user_id === "user_1") && rows.some((row) => row.user_id === "user_2"),
+        "两行不属于不同用户",
+    );
+    db.close();
+});
+
+check("幂等隔离：同一用户对两个画布用同一 key → 应判冲突而非返回第一个画布的任务", () => {
+    const { db } = createQueueDb();
+    const key = "same_body_hash";
+
+    insertJob(db, { id: "job_cv1", userId: "user_1", canvasId: "cv_1", idempotencyKey: key });
+
+    db.exec("BEGIN IMMEDIATE");
+    const existing = db.prepare(SQL.selectByIdempotency).get(key, "user_1");
+    db.exec("COMMIT");
+
+    // 查询层按 user 隔离后仍会命中（同用户），所以要靠调用方比对 canvas_id。
+    assert(existing, "同用户同键应命中既有任务");
+    assertEqual(existing.canvas_id, "cv_1", "命中的应是第一个画布的任务");
+    // 前端对 cv_2 提交 → 这里必须判冲突（409），而不是把 cv_1 的任务返回去。
+    assert(existing.canvas_id !== "cv_2", "cv_2 的请求错误地命中了 cv_1 的任务");
+    db.close();
+});
+
+check("幂等索引：唯一索引已按 (user_id, idempotency_key) 建立", () => {
+    const { db } = createQueueDb();
+    const indexes = db
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs' AND name LIKE '%idempotency%'")
+        .all();
+
+    assertEqual(indexes.length, 1, `幂等索引应恰好 1 个，实际 ${indexes.length}：${indexes.map((row) => row.name).join(",")}`);
+    assert(/user_id/.test(indexes[0].sql ?? ""), `索引未包含 user_id：${indexes[0].sql}`);
+    assert(/UNIQUE/i.test(indexes[0].sql ?? ""), "幂等索引必须是唯一索引");
+    db.close();
+});
+
 check("成功收尾：写结果键 + progress=1 + 清 lease", () => {
     const { db } = createQueueDb();
     insertJob(db);
     const claimed = claim(db);
     const keys = JSON.stringify(["image:aaa", "image:bbb"]);
 
-    const result = db.prepare(SQL.finishSucceeded).run(keys, 0.42, iso(NOW), iso(NOW), claimed.id);
+    // 末位是 attempt：收尾 SQL 靠它做围栏（见下面"僵尸 Worker"一组用例）。
+    const result = db.prepare(SQL.finishSucceeded).run(keys, 0.42, iso(NOW), iso(NOW), claimed.id, claimed.attempt);
     assertEqual(Number(result.changes), 1, "收尾应命中 1 行");
 
     const row = db.prepare("SELECT status, progress, result_storage_keys, cost_actual, lease_until FROM jobs WHERE id = ?").get(claimed.id);
@@ -500,13 +575,106 @@ check("失败收尾：可重试 → 回 queued 并清 lease", () => {
     insertJob(db, { maxAttempts: 3 });
     const claimed = claim(db);
 
-    db.prepare(SQL.finishFailed).run("queued", "QUOTA_EXCEEDED", "上游限流", 1, iso(new Date(NOW.getTime() + 30_000)), null, iso(NOW), claimed.id);
+    db.prepare(SQL.finishFailed).run("queued", "QUOTA_EXCEEDED", "上游限流", 1, iso(new Date(NOW.getTime() + 30_000)), null, iso(NOW), claimed.id, claimed.attempt);
 
     const row = db.prepare("SELECT status, error_code, retryable, finished_at FROM jobs WHERE id = ?").get(claimed.id);
     assertEqual(row.status, "queued", "可重试失败应回到 queued");
     assertEqual(row.error_code, "QUOTA_EXCEEDED", "错误码未写入");
     assertEqual(row.retryable, 1, "应标记可重试");
     assertEqual(row.finished_at, null, "可重试时不应写 finished_at");
+    db.close();
+});
+
+// QA R2 `P1-R2-1`：僵尸 Worker 覆盖新 Worker 的成果。**这一组是最严重的一条。**
+//
+// 复现时序（QA 实测）：
+//   A 认领 attempt=1 → 心跳写库抛异常（SQLITE_BUSY）→ reaper 回队
+//   → B 认领 attempt=2 → A 僵尸收尾 changes=1，写入 image:A-STALE
+//   → B 正常收尾 changes=0，成果被丢
+//   → 用户看到上一次失败运行的图，attempt 被真实消耗、上游计费两次
+//
+// 为什么 `WHERE status='running'` 不够：任务被 reaper 回队、又被 B 认领之后
+// 状态**又变回 running**，旧 Worker 的收尾照样命中。真正的围栏是 `attempt`。
+check("僵尸 Worker：A(attempt=1) 心跳失败→被回队→B(attempt=2) 认领后，A 收尾必须 changes=0", () => {
+    const { db } = createQueueDb();
+    insertJob(db, { id: "job_zombie", maxAttempts: 3 });
+
+    // A 认领 → attempt=1
+    const claimedA = claim(db, 60);
+    assertEqual(claimedA.attempt, 1, "A 认领后 attempt 应为 1");
+
+    // reaper 把过期租约回队（还有重试余量）。
+    // 退避时间刻意写成 NOW 而不是 NOW+30s：本用例要的是"B 能立刻重新认领"，
+    // 背-off 到未来的话 B 认领不到，测的就不是围栏而是 run_after 了。
+    db.prepare("UPDATE jobs SET lease_until = ? WHERE id = ?").run(iso(new Date(NOW.getTime() - 1)), claimedA.id);
+    const requeued = db.prepare(SQL.requeueExpired).run(iso(NOW), iso(NOW), iso(NOW), iso(NOW));
+    assertEqual(Number(requeued.changes), 1, "应被回队");
+
+    // B 认领 → attempt=2（注意：此时 status 又是 'running'）
+    const claimedB = claim(db, 60);
+    assertEqual(claimedB?.id, "job_zombie", "B 应认领到同一任务");
+    assertEqual(claimedB.attempt, 2, "B 认领后 attempt 应为 2");
+
+    const row = db.prepare("SELECT status FROM jobs WHERE id = ?").get(claimedA.id);
+    assertEqual(row.status, "running", "此刻状态确实是 running —— 这正是只查 status 会被骗的原因");
+
+    // **关键断言**：僵尸 A 拿自己那次的 attempt=1 去收尾，必须一行都改不动。
+    const staleSucceeded = db.prepare(SQL.finishSucceeded).run(
+        JSON.stringify(["image:A-STALE"]),
+        null,
+        iso(NOW),
+        iso(NOW),
+        claimedA.id,
+        claimedA.attempt, // = 1，而当前是 2
+    );
+    assertEqual(Number(staleSucceeded.changes), 0, "僵尸 Worker 的成功收尾命中了！它会把新 Worker 的成果覆盖成旧结果");
+
+    const staleFailed = db.prepare(SQL.finishFailed).run(
+        "queued",
+        "PROVIDER_UPSTREAM_ERROR",
+        "僵尸写回的失败",
+        1,
+        iso(new Date(NOW.getTime() + 30_000)),
+        null,
+        iso(NOW),
+        claimedA.id,
+        claimedA.attempt,
+    );
+    assertEqual(Number(staleFailed.changes), 0, "僵尸 Worker 的失败收尾命中了（会污染 attempt 与退避）");
+
+    // 反向确认：B 用自己那次的 attempt=2 收尾必须成功 —— 否则围栏把正常路径也挡死了。
+    const fresh = db.prepare(SQL.finishSucceeded).run(
+        JSON.stringify(["image:B-FRESH"]),
+        null,
+        iso(NOW),
+        iso(NOW),
+        claimedB.id,
+        claimedB.attempt,
+    );
+    assertEqual(Number(fresh.changes), 1, "正常 Worker 的收尾被误伤（围栏写错了）");
+
+    const final = db.prepare("SELECT status, result_storage_keys, attempt FROM jobs WHERE id = ?").get(claimedA.id);
+    assertEqual(final.status, "succeeded", "最终状态应为 succeeded");
+    assertEqual(final.result_storage_keys, JSON.stringify(["image:B-FRESH"]), "最终留下的应是新 Worker 的成果");
+    assertEqual(final.attempt, 2, "attempt 不应被僵尸污染");
+    db.close();
+});
+
+check("认领：attempt 已耗尽（attempt=max_attempts）的行不再被认领", () => {
+    const { db } = createQueueDb();
+    // 直接构造 QA 描述的那条脏行：attempt=2 / max=2，却因 requeueExpired 中途崩溃停在 queued。
+    insertJob(db, { id: "job_exhausted", maxAttempts: 2 });
+
+    // 每次认领后都要手动放回 queued —— running 状态是不会被再次认领的。
+    for (let round = 0; round < 2; round += 1) {
+        claim(db, 60);
+        db.prepare("UPDATE jobs SET status = 'queued', lease_until = NULL, run_after = ? WHERE id = ?").run(iso(NOW), "job_exhausted");
+    }
+
+    const row = db.prepare("SELECT attempt, max_attempts FROM jobs WHERE id = ?").get("job_exhausted");
+    assertEqual(row.attempt, 2, "构造失败：attempt 应为 2");
+
+    assertEqual(claim(db), undefined, "attempt 已耗尽的行仍被认领（会超出 max_attempts 并多计费一次）");
     db.close();
 });
 

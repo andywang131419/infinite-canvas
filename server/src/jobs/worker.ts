@@ -73,6 +73,21 @@ let stopping: Promise<void> | null = null;
 const running = new Set<Promise<void>>();
 
 /**
+ * 在途任务的 AbortController。
+ *
+ * 存在的理由：以前 `stopWorker()` 的注释写着"10s 后强停"，但**没有任何 abort**
+ * —— 它只是 `while (inFlight > 0)` 干等，超时后照样把 state 置成 stopped 就返回。
+ * 结果 handler 继续跑、心跳定时器继续续租，进程其实退不干净（QA R2 队列类 P2）。
+ *
+ * 现在超时未结束时逐个 abort：`executeJob` 里 `controller.signal.aborted` 一旦为真
+ * 就不会写成功也不写失败，租约随进程一起消失，由 reaper 回队重跑。
+ *
+ * 局限（如实记录）：abort 只是"发信号"，handler 若不检查 `ctx.signal` 仍会继续跑完。
+ * 强制杀不掉是 JS 单线程的本质限制，这里能做的是保证**不写库**。
+ */
+const activeControllers = new Set<AbortController>();
+
+/**
  * 注册一个 job type 的处理器。
  *
  * 同一 type 重复注册会抛错——避免启动期静默覆盖导致任务被错误实现处理。
@@ -155,6 +170,12 @@ export function stopWorker(): Promise<void> {
             await sleep(50);
         }
 
+        // 真·强停：给在途任务发 abort，让它们放弃写库（租约随之失效，由 reaper 回队）。
+        if (activeControllers.size > 0) {
+            for (const controller of activeControllers) controller.abort();
+            console.warn(`[worker] 停机超时，已向 ${activeControllers.size} 个在途任务发送 abort`);
+        }
+
         state = "stopped";
         stopping = null;
         console.info(`[worker] 已停止（此前状态：${previous}，在途剩余：${inFlight}）`);
@@ -230,11 +251,24 @@ async function tick(): Promise<void> {
 async function executeJob(job: JobRow): Promise<void> {
     const env = getEnv();
     const controller = new AbortController();
+    activeControllers.add(controller);
 
     let leaseLost = false;
     let timer: ReturnType<typeof setInterval> | null = null;
 
-    /** 续租间隔取租约的 1/3，保证两次续租之间至少有 2 次容错机会。 */
+    /**
+     * 续租间隔取租约的 1/3，保证两次续租之间至少有 2 次容错机会。
+     *
+     * **QA R2 `P1-R2-1`**：心跳**抛异常**时过去只 `console.error`、不置 `leaseLost`，
+     * 于是下面 `if (leaseLost || aborted)` 拦不住，僵尸 Worker 照样收尾写库。
+     *
+     * 这不是理论风险：心跳是写库操作，而 `docs/KNOWN-ISSUES.md` §6 记着
+     * 「备份容器以 root 对生产库做 INSERT」—— 那正是 `SQLITE_BUSY` 的来源
+     * （busy_timeout=5000，大库 checkpoint 时确实会超）。写库抛异常是常态而非异常。
+     *
+     * 所以：**拿不到"续租成功"这个明确答案，就按租约已丢失处理并 abort**。
+     * 宁可浪费一次上游调用，也不能让旧结果覆盖新 Worker 的成果。
+     */
     const heartbeatMs = Math.max(1000, Math.floor((env.WORKER_LEASE_SECONDS * 1000) / 3));
     timer = setInterval(() => {
         try {
@@ -244,7 +278,9 @@ async function executeJob(job: JobRow): Promise<void> {
                 console.warn(`[worker] 任务 ${job.id} 租约已被回收，abort 执行`);
             }
         } catch (error) {
-            console.error(`[worker] 任务 ${job.id} 心跳失败`, error);
+            leaseLost = true;
+            controller.abort();
+            console.error(`[worker] 任务 ${job.id} 心跳失败，按租约丢失处理并 abort`, error);
         }
     }, heartbeatMs);
     (timer as unknown as { unref?: () => void }).unref?.();
@@ -297,7 +333,9 @@ async function executeJob(job: JobRow): Promise<void> {
             return;
         }
 
-        const written = markSucceeded(job.id, result.storageKeys, result.costActual);
+        // 传整个 job：`attempt` 是这次认领的 fencing token（收尾 SQL 的 `AND attempt = ?`），
+        // 只传 id 的话旧 Worker 仍能把结果写进已被别人重跑的任务里（QA R2 P1-R2-1）。
+        const written = markSucceeded(job, result.storageKeys, result.costActual);
         if (!written) {
             // 0 行受影响：任务已不在 running（被取消或被判失败），结果只能记录无法写回。
             console.warn(`[worker] 任务 ${job.id} 收尾失败（状态已变更），结果键：${result.storageKeys.join(",")}`);
@@ -315,10 +353,17 @@ async function executeJob(job: JobRow): Promise<void> {
 
         const failure = classifyError(error);
         const outcome = markFailed(job, failure, env.JOB_RETRY_BACKOFF_S);
-        const suffix = outcome.nextAttemptInSeconds === null ? "（不再重试）" : `（${outcome.nextAttemptInSeconds}s 后重试）`;
+        // `applied=false` 说明这一行已经不是我们在跑（被用户取消 / 被 reaper 回收 /
+        // 已被另一个 Worker 收尾）。此时说"X 秒后重试"是假承诺 —— 那次重试不会发生。
+        const suffix = !outcome.applied
+            ? "（未写入：任务已不在本次租约下，可能已被取消或被他人收尾）"
+            : outcome.nextAttemptInSeconds === null
+              ? "（不再重试）"
+              : `（${outcome.nextAttemptInSeconds}s 后重试）`;
         console.error(`[worker] 任务 ${job.id} 失败：${failure.code} ${failure.message}${suffix}`);
     } finally {
         if (timer) clearInterval(timer);
+        activeControllers.delete(controller);
     }
 }
 

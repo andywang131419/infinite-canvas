@@ -146,7 +146,11 @@ await check("迁移由真实执行器跑完（schema_migrations 有记录）", (
         info.appliedNow.some((name) => name.startsWith("0001_")),
         `本次应实际执行 0001_*.sql，实际：${JSON.stringify(info.appliedNow)}`,
     );
-    assertEqual(info.version, 1, "schema 版本应停在 1");
+    // 不写死版本号，而是断言「执行器把找到的迁移全部跑完了」。
+    // 这样新增 0002（幂等键按用户隔离 + backups.media_expected）之后不用改这里，
+    // 但若某个迁移没被应用（比如文件命名不合规范被跳过）就会被抓到。
+    assertEqual(info.version, info.total, "schema 版本应与磁盘上的迁移文件数一致（有迁移没被应用）");
+    assert(info.appliedNow.some((name) => name.startsWith("0002_")), `本次应实际执行 0002_*.sql，实际：${JSON.stringify(info.appliedNow)}`);
 });
 
 await check("外键真的开着（P0-1 的成因前提）", () => {
