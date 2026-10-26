@@ -278,6 +278,7 @@ $ grep -c '=$' .env
 | `BACKUP_ENABLED` | 🟧 | **只能写 `true`** | 🔴 写 `1` / `yes` / `on` / `True` → `entrypoint.sh:11` 只认精确的 `"true"`，会被判为"关闭备份" → **容器空转、一条备份都不做，而且没有任何报错**（详见附录 A F2）。在修复前请**写死 `true`** |
 | `BACKUP_INCLUDE_MEDIA` | 🟧 | `true` | 写 `false`/`0`/`no`/`off` → 只备份数据库，媒体零备份 → **恢复后画布里所有图 404**。另外不能写 `maybe` 这类无法判定的值，否则 server 启动崩溃 |
 | `RCLONE_REMOTE` + `RCLONE_DEST` | 🟧 | 远端名与目标路径，如 `mycos` / `ic-backup/2026` | 留空 = **只有 VPS 本地一份备份**。VPS 一毁全没。这是本项目最该补的一项 |
+| `RCLONE_CONFIG_FILE` | 🟩 | **保持默认**（`/root/.config/rclone/rclone.conf`） | 只有把 `rclone.conf` 放到别处才需要改（改法见 6.4）。注意：改了这个值**必须确认 compose 的 backup 服务已把它透传进容器**，否则容器里拿不到、仍然走默认路径 |
 | `BACKUP_ON_START` | 🟧 | —— | 🔴 **这个变量现在写了也没用**：只有 `entrypoint.sh:33` 读它，但 compose 和 `.env.example` 都没声明它 → 永远取默认 `false` → **首份备份要等到第二天凌晨 3 点**。首次上线请按 6.2 手动跑一次 |
 | `DATABASE_PATH` | 🟩 | **保持 `/data/app.db`** | 改了就必须同步改 backup 服务的 `DATABASE_PATH`，否则备份打的是空库 |
 | `STORAGE_LOCAL_ROOT` | 🟩 | **保持 `/data/media`** | 改了必须同步改 backup 服务的 `STORAGE_LOCAL_ROOT`，否则 `backup.sh` 找不到目录 → 记 failed 并退出 |
@@ -614,8 +615,9 @@ $ echo "退出码=$?"
 $ mkdir -p /srv/ic/deploy/rclone
 
 # 2) 用交互向导生成远端（会在容器里问你一堆问题，按对象存储提供的参数填）
+#    挂载点与备份容器里的实际位置保持一致（见下方说明），向导落下来的文件就是能直接用的那份
 $ docker run --rm -it \
-    -v /srv/ic/deploy/rclone:/config/rclone \
+    -v /srv/ic/deploy/rclone:/root/.config/rclone \
     alpine:3.20 sh -c 'apk add --no-cache rclone >/dev/null && rclone config'
 # 按向导：n（新建）→ 起个名字（比如 mycos）→ 选存储类型（S3/COS/OSS…）→ 填 key/secret/region/endpoint
 # 完成后退出
@@ -624,27 +626,34 @@ $ sudo ls -l /srv/ic/deploy/rclone/
 # 预期：rclone.conf 存在
 ```
 
-**⚠️ 关键坑（附录 A F1）**：容器里的 rclone 是 alpine 版，**默认去找 `/root/.config/rclone/rclone.conf`，而不是 compose 挂载的 `/config/rclone/rclone.conf`**。所以现在这样配完，**cron 里的 `rclone copy` 会报找不到 remote**。先验证：
+**⚠️ 挂载点这个问题已经在代码里修好了（附录 A F1，commit `ee47e8c`）。这里是给你确认用的，不需要你再补救。**
+
+现象（写给"为什么会有这段"）：容器里装的是 **Alpine 官方 rclone 包**，不是 LinuxServer 系镜像。
+它默认只读 `$HOME/.config/rclone/rclone.conf`，以 root 运行就是 **`/root/.config/rclone`**，
+**不会**自动去读 `/config/rclone` —— 那是 LinuxServer 镜像的约定。以前 compose 把宿主 `./rclone`
+挂到了 `/config/rclone`，于是 `RCLONE_REMOTE` 配了也连不上远端，异地备份等于没开。
+
+现在三处已经对齐：
+
+| 位置 | 现状 |
+| --- | --- |
+| `deploy/docker-compose.yml`（`backup.volumes`） | `- ./rclone:/root/.config/rclone:ro` |
+| `deploy/backup/Dockerfile` | 启动时 `mkdir -p /root/.config/rclone` |
+| `deploy/backup/backup.sh` | 显式 `rclone copy … --config "$RCLONE_CONFIG_FILE"`，兜住 busybox `crond` 派生环境可能不设 `HOME` 的情况 |
+
+验证：
 
 ```bash
 $ docker compose up -d --force-recreate backup
 $ docker exec ic-backup rclone config file
-# 如果输出是 /root/.config/rclone/rclone.conf → 中招了，按下面二选一处理
-```
-
-处理办法（**二选一，推荐第一种**）：
-
-```bash
-# 办法 A（不动任何文件，但容器重建后要重做）：软链过去
-$ docker exec ic-backup sh -c 'mkdir -p /root/.config/rclone && ln -sf /config/rclone/rclone.conf /root/.config/rclone/rclone.conf'
+# 预期：/root/.config/rclone/rclone.conf
 $ docker exec ic-backup rclone listremotes
 # 预期：输出你配的远端名，例如 mycos:
-
-# 办法 B（推荐，一劳永逸）：给 compose 加一行环境变量
-#   在 deploy/docker-compose.yml 的 backup.environment 里加：
-#       RCLONE_CONFIG: /config/rclone/rclone.conf
-#   然后 docker compose up -d --force-recreate backup
 ```
+
+想把配置文件放别处时：走的是 **`RCLONE_CONFIG_FILE`**（`backup.sh` 读的就是这个变量，改完要在 compose 的
+`backup.environment` 里透传）。
+注意别设 `RCLONE_CONFIG` —— `backup.sh` 用命令行 `--config` 显式传路径，flag 优先级高于同名环境变量，设了会被忽略。
 
 在 `.env` 里填远端：
 
@@ -660,9 +669,19 @@ BACKUP_TARGET_LABEL=对象存储-上海  # 只是展示用，别写真密钥
 $ docker exec ic-backup /usr/local/bin/backup.sh     # 手动跑一次
 $ docker exec ic-backup rclone ls "mycos:ic-backup/canvas" | tail -n 5
 # 预期：能看到 app-….sqlite.gz 与 media-….tar.gz
-# 不达标说明什么：
-#   - "didn't find section in config file" → 就是上面那个坑，配置没被读到
-#   - 上传失败 → backup.sh 会写 failed 审计行并 exit 1，但**本地备份文件仍然在**
+# 不达标按下面的报错对号入座：
+#   - "couldn't find config file" / 审计行 error_message = "rclone config missing"
+#       → rclone.conf 没放进 deploy/rclone/（或没 --force-recreate）。这是显式失败：
+#         backup.sh 已记 failed 审计行并 exit 1，**不会再静默只留本地**。
+#   - "didn't find section in config file"
+#       → 配置读到了，但里面的远端名和 .env 的 RCLONE_REMOTE 不一致。
+#         用 `rclone listremotes` 核对：`RCLONE_REMOTE` 填的是冒号**前面**那段（如 `mycos`，不带冒号），大小写要一致。
+#   - "Failed to copy" / 审计行 error_message = "rclone upload failed"
+#       → key/secret/endpoint/region 填错或桶权限不够。本地备份文件仍然在。
+```
+
+> **排障入口变了**：这三类失败现在都会写进 `backups` 表的审计行。
+> 直接看**设置页的备份历史**（`error_message` 列）就行，不需要先去翻 `docker compose logs backup`。
 ```
 
 ### 6.5 远端保留策略（当前没有，自己补）
@@ -884,7 +903,7 @@ $ cd deploy && docker compose up -d --build
 | 4 | 备份在跑 | `docker exec ic-backup sqlite3 -header -column /data/app.db "SELECT status, COUNT(*) c FROM backups WHERE started_at > datetime('now','-7 days') GROUP BY status;"` | 只有 `success`，**没有 `failed`** | 有 failed → 查 `error_message`；一条都没有 → cron 没跑，看 `docker exec ic-backup cat /etc/crontabs/root` |
 | 5 | 备份文件在长 | `docker exec ic-backup sh -c 'ls -lht /data/backups \| head -n 6'` | 有当天的 `app-*.sqlite.gz` **和** `media-*.tar.gz`，大小 > 0 | 缺 media → `BACKUP_INCLUDE_MEDIA` 被关了（媒体零备份，恢复后全是裂图） |
 | 6 | 媒体真的被打包了 | 同上查询里的 `media_files > 0` 且 `media_expected = 1` | `media_files` 大于 0 | `media_files=0` 但 `media_expected=1` → 媒体目录是空的或卷没挂上 |
-| 7 | 异地副本存在 | `docker exec ic-backup rclone ls "<RCLONE_REMOTE>:<RCLONE_DEST>" \| tail -n 5` | 能看到最新的两个文件 | 报 "didn't find section" → 附录 A F1（rclone 配置路径） |
+| 7 | 异地副本存在 | `docker exec ic-backup rclone ls "<RCLONE_REMOTE>:<RCLONE_DEST>" \| tail -n 5` | 能看到最新的两个文件 | `didn't find section` → `rclone listremotes` 里的远端名与 `.env` 的 `RCLONE_REMOTE` 不一致；`couldn't find config file` 或审计行 `rclone config missing` → `deploy/rclone/rclone.conf` 没放进去，看第 6.4 节 |
 | 8 | 磁盘余量 | `df -h /var/lib/docker` | 使用率 **< 70%** | > 85% → 备份 tar 会失败、数据库会写不进去，立刻扩容或清媒体 |
 | 9 | 数据库文件属主 | `docker exec ic-server sh -c 'ls -l /data/app.db*'` | `app.db(-wal/-shm)` 属主都是 `bun`，**不是 root** | 出现 root 属主 → 备份容器以 root 写库留下的副作用（KNOWN-ISSUES 第 6 条），立刻 `docker exec ic-backup sh -c 'chown 1000:1000 /data/app.db*'`，否则服务端会写不进去 |
 | 10 | 登录与保存 | 浏览器：登录 → 新建画布 → 上传一张图 → 刷新页面 | 都还在，图片能显示 | 保存失败 → 第 9 条的属主问题；图片裂 → 媒体没恢复/没备份 |
@@ -902,7 +921,7 @@ $ cd deploy && docker compose up -d --build
 
 | 风险 | 自查方法 | 看到什么 = 踩坑了 |
 | --- | --- | --- |
-| 🔴 rclone 配置读不到（异地备份实际没生效） | `docker exec ic-backup rclone config file` | 输出不是 `/config/rclone/rclone.conf`，且审计行里出现 `rclone upload failed` |
+| 🔴 异地备份实际没生效 | ①`docker exec ic-backup rclone config file` ②设置页备份历史 / 第 8 节第 4 条的审计行 | ①输出不是 `/root/.config/rclone/rclone.conf` ②审计行里出现 `rclone config missing` 或 `rclone upload failed` |
 | 🔴 `BACKUP_ENABLED` 写成 `1/yes/on` → 备份被静默关闭 | `grep '^BACKUP_ENABLED' /srv/ic/deploy/.env` + 第 8 节第 4 条 | 值不是 `true`，且 `backups` 表连续 7 天没有任何新行 |
 | 🔴 设置页「立即备份」按钮失败 | 点一下看返回；或 `docker compose logs server \| grep -i backup` | 报 `BACKUP_FAILED`（第 4.4 节的 chown 没做） |
 | 🟡 首份备份要等到次日 03:00 | 上线当天 `ls /data/backups` | 上线当天目录是空的（按 6.3 手动跑一次） |
@@ -931,11 +950,14 @@ $ cd deploy && docker compose up -d --build
 - ✅ **没有发现"卷挂载缺失导致数据不持久"**：`server`（第 131 行）与 `backup`（第 177 行）都挂了 `data:/data`，数据库与媒体都在持久化卷上。
 - ✅ **没有发现端口前后不一致**：`web` 内 3000（nginx.conf:2 / compose:62）、`server` 内 8787（compose:79,133 / Caddyfile:56），三处一致。
 - ✅ **cron 的退出码没有被管道吞掉**：`deploy/backup/crontab:7` 用的是 `>> /proc/1/fd/1 2>&1`（重定向，不是 `| tee` 之类），退出码保留。真正的问题是**失败了没人知道**（见 F6）。
-- 🔴 **发现 3 个会让备份静默失效的真问题**（F1/F2/F3），其中 F1 关系到"VPS 毁了数据还在不在"。
+- 🟢 **F1（rclone 配置读不到）已修**（commit `ee47e8c`）：挂载点改为 `/root/.config/rclone` + `backup.sh` 显式 `--config`；并且缺少配置时从「静默只留本地」改成**记 failed 审计行并 exit 1**。上线后按第 6.4 节验证一次即可。
+- 🔴 **仍未修的是 F2 / F3**（两者都会让备份失效，**F2 还完全不报错**），上线前必须做完两件小事：
+  `.env` 里 `BACKUP_ENABLED` **只能写 `true`**（写 `1`/`yes`/`on` 会被判成关闭，见 F2）；
+  启动后执行 `docker exec ic-backup sh -c 'chown -R 1000:1000 /data/backups'`（否则设置页「立即备份」必然失败，见 F3）。
 
 | # | 位置 | 后果（一句话） | 怎么改 |
 | --- | --- | --- | --- |
-| **F1** 🔴 | `deploy/docker-compose.yml:179`（`- ./rclone:/config/rclone:ro`） | 容器里是 **alpine 版 rclone**，默认去读 `/root/.config/rclone/rclone.conf`，**不会**自动读挂载进来的 `/config/rclone/rclone.conf` → 一旦配了 `RCLONE_REMOTE`，`backup.sh` 的上传步骤失败 → 记 `failed` 审计行并 `exit 1`。此时数据**只有 VPS 本地一份**，等于异地备份完全没生效 | 在 `backup.environment` 里加一行 `RCLONE_CONFIG: /config/rclone/rclone.conf`（或 `XDG_CONFIG_HOME: /config`）。不改文件的临时办法：容器内 `ln -sf /config/rclone/rclone.conf /root/.config/rclone/rclone.conf`。验证：`docker exec ic-backup rclone config file` |
+| **F1** ✅ **已修**（commit `ee47e8c`） | 原 `deploy/docker-compose.yml`（`- ./rclone:/config/rclone:ro`） | 容器里是 **alpine 版 rclone**，默认去读 `/root/.config/rclone/rclone.conf`，**不会**自动读挂载进来的 `/config/rclone/rclone.conf` → 一旦配了 `RCLONE_REMOTE`，异地备份完全不生效 | 挂载点改为 `./rclone:/root/.config/rclone:ro`（compose、`Dockerfile` 的 `mkdir`、`backup.sh` 的 `--config` 三处已对齐）；同时 `RCLONE_REMOTE` 非空却找不到配置时改为**记 failed 审计行并 `exit 1`**，不再是静默失效。**上线后仅需验证**：`docker exec ic-backup rclone config file` 输出 `/root/.config/rclone/rclone.conf` |
 | **F2** 🔴 | `deploy/backup/entrypoint.sh:11`（`if [ "${BACKUP_ENABLED:-true}" != "true" ]`） | 提交 `997435f` 统一了 `env.ts` 与 `backup.sh` 的布尔口径（认 `true/1/yes/on`），但 **entrypoint 没跟着改**，仍只认精确的 `"true"` → 把 `BACKUP_ENABLED` 写成 `1`/`yes`/`on`/`True` 会被判为"关闭" → 容器进入空转、**一条备份都不做，且无任何报错**（第 33 行的 `BACKUP_ON_START` 同理） | entrypoint 里复用与 `backup.sh` 相同的 `is_truthy` 判定。**在此之前：`.env` 里的 `BACKUP_ENABLED` 必须写死 `true`** |
 | **F3** 🔴 | `deploy/backup/entrypoint.sh:18`（`mkdir -p /etc/crontabs /data/backups`，以 root 执行） | `/data/backups` 被建成 **root:root 755**，而 server 容器里进程是 `bun`（uid 1000）→ 设置页的「立即备份」（`POST /api/backups/run`，要往 `/data/backups` 写文件）**必然失败**，返回 `BACKUP_FAILED`。cron 备份不受影响（它自己就是 root） | 启动后执行一次 `docker exec ic-backup sh -c 'chown -R 1000:1000 /data/backups'`（第 4.4 节第 2 步）。彻底修法：让备份容器以 uid 1000 运行并写审计行（但 busybox crond 需要 root，需连 `KNOWN-ISSUES` 第 6 条一起设计） |
 | **F4** 🟡 | `deploy/backup/backup.sh:198`（媒体目录不存在即判失败） | 全新部署时 `/data/media` **不存在**（server 只在第一次落盘资产时才 `mkdir`，见 `storage/local-disk.ts:66`）→ 上线第一晚若还没传过任何图，备份会记 `failed` 并 `exit 1`。不是数据丢失，但会让人误以为"备份坏了" | 首次启动后执行一次 `docker exec ic-server mkdir -p /data/media`（以 bun 身份建，属主正确）。或在 `server` 启动时预建该目录 |
@@ -946,8 +968,8 @@ $ cd deploy && docker compose up -d --build
 
 ### 修复优先级建议
 
-1. **F1**（异地备份实际不生效）—— 数据生命线，最高。
-2. **F2**（备份被静默关闭）—— 最阴险，因为它不报错。
+1. ~~**F1**（异地备份实际不生效）~~ ✅ **已修（`ee47e8c`）**：升级后按第 6.4 节验证一次 `rclone config file` 即可。
+2. **F2**（备份被静默关闭）—— **现在是最高优先级**，因为它不报错。
 3. **F3**（手动备份按钮失败）—— 影响你对"备份能用"的信心。
 4. F5 / F4 —— 影响首日体验，有手动规避办法。
 5. F6 / F7 / F8 —— 可观测性与成本，随版本迭代处理。

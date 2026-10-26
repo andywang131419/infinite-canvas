@@ -185,7 +185,7 @@
 
 补充两个小项（并入上表口径，不单列编号）：
 - `server/Dockerfile` 未 `COPY scripts/`，但 `package.json:16` 暴露了 `user:create` → 容器内 `bun run user:create` 必然失败（`/api/setup` 已覆盖该场景，但文档/脚本存在性不一致）。
-- `deploy/rclone/` 目录未入库，`docker-compose.yml:163` 的 `./rclone:/config/rclone:ro` 会由 Docker 自动建成 root 属主空目录；建议提交一个 `.gitkeep` + 注释。
+- `deploy/rclone/` 目录未入库，`docker-compose.yml:163` 的 `./rclone:/config/rclone:ro` 会由 Docker 自动建成 root 属主空目录；建议提交一个 `.gitkeep` + 注释。（后于 `ee47e8c` 迁移到 `/root/.config/rclone`，见 `docs/DEPLOY-VPS.md` 6.4）
 - `server/src/routes/canvases.ts:95`：`readJsonBody` 在 `requireCanvasId` 之前，非法 id 也会先把 200MB body 读进来（Bun `maxRequestBodySize` 兜底，故仅浪费）。
 
 ---
