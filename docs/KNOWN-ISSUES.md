@@ -184,3 +184,5 @@ Caddy 会忽略客户端自带的 `X-Forwarded-*` 并写入真实 IP。但将来
 | `deploy/rclone/` 未入库 | `deploy/docker-compose.yml` | `./rclone:/config/rclone:ro` 会由 Docker 自动建成 root 属主空目录 | 提交 `deploy/rclone/.gitkeep` + 说明注释 |
 | 先读 body 再校验 id | `server/src/routes/canvases.ts` | `readJsonBody` 在 `requireCanvasId` 之前，非法 id 也会先把最大 200MB 的 body 读进来（Bun 的 `maxRequestBodySize` 兜底，仅浪费） | 把 `requireCanvasId` 提到读 body 之前 |
 | 单用户分支不承载多租户语义 | 全局 | `ALLOW_REGISTRATION=false` + `/api/setup` 单用户，是当前所有"单用户下不可触发"判定的前提 | **放开注册之前**，必须把本文件第 1、3、8 条一起修完 |
+| antd 6 Modal `styles` 类型不接受 `content` | `web/src/components/layout/model-script-editor.tsx:58` | `Modal` 的 `styles` 只接受 `root/header/body/...`，传 `content` 报 TS2353。**基线自带，非 T04-A 引入**（`git diff HEAD -- <该文件>` 为空，文件从未被改动） | T05 统一处理：改用 `classNames` 或把 `content` 挪到 `body` 上 |
+| Caddyfile CSP 仍是 `unsafe-inline` + `unsafe-eval` | `deploy/Caddyfile:97` | `index.html` 内联主题脚本需要。hash 化（外置脚本改用 nonce/hash）本轮未做 | T05 做 CSP hash 化 |

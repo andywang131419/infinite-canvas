@@ -2,11 +2,26 @@ import { saveAs } from "file-saver";
 
 import i18n from "@/i18n";
 import { createZip } from "@/lib/zip";
-import { getMediaBlob } from "@/services/file-storage";
-import { getImageBlob } from "@/services/image-storage";
+import { fetchStoredMediaBlob } from "@/services/file-storage";
+import { fetchStoredImageBlob } from "@/services/image-storage";
+import { serverFetch } from "@/services/server-fetch";
 import type { CanvasExportAsset, CanvasExportFile } from "@/types/canvas-export";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+
+/**
+ * 按 storageKey 取资产字节：**本地 IndexedDB 优先，服务端兜底**。
+ *
+ * 资产上云（T04-A4）之后服务端才是权威副本。换设备 / 清缓存打开画布时本地
+ * IndexedDB 是空的，只按本地读会把 ZIP 里的图全部导出成空文件 ——
+ * 这正是 A4 要解决的"导出碎图"。
+ *
+ * 这里不自己实现兜底逻辑：`fetchStoredImageBlob` / `fetchStoredMediaBlob`
+ * 已经是"本地优先 + 服务端回源"，直接按命名空间分派即可。
+ */
+async function readAssetBlob(storageKey: string): Promise<Blob | null> {
+    return storageKey.startsWith("image:") ? fetchStoredImageBlob(storageKey) : fetchStoredMediaBlob(storageKey);
+}
 
 export async function exportCanvasProjects(projects: CanvasProject[], fileName = i18n.t("canvas.export.defaultProjectName")) {
     const zipFiles: { name: string; data: BlobPart }[] = [];
@@ -15,7 +30,8 @@ export async function exportCanvasProjects(projects: CanvasProject[], fileName =
             const files: CanvasExportAsset[] = [];
             await Promise.all(
                 collectStorageKeys(project).map(async (storageKey) => {
-                    const blob = storageKey.startsWith("image:") ? await getImageBlob(storageKey) : await getMediaBlob(storageKey);
+                    // 走 readAssetBlob 而不是直接读本地：导出也要能读服务端副本。
+                    const blob = await readAssetBlob(storageKey);
                     if (!blob) return;
                     const path = `projects/${project.id}/files/${safeFileName(storageKey)}.${fileExtension(blob.type, storageKey)}`;
                     files.push({ storageKey, path, mimeType: blob.type || "application/octet-stream", bytes: blob.size });
