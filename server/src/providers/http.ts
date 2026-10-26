@@ -14,6 +14,8 @@
 import { ProviderError } from "./types.ts";
 import type { ProviderContext } from "./types.ts";
 
+import { checkTarget, resolveAndCheckHost } from "../proxy/guard.ts";
+
 /** 一条待发请求的描述（纯数据，便于 fixture 对比）。 */
 export type ProviderRequest = {
     url: string;
@@ -255,13 +257,48 @@ export async function sendBytes(ctx: ProviderContext, request: ProviderRequest):
 /**
  * 下载一个 URL 的字节（图片/视频结果通常以 URL 形式返回）。
  *
- * 只允许 http/https；不递归跟随到非 http 协议。
+ * ⚠️ QA R2 `P1-R2-2`：**这里曾经是一条完整 SSRF，且能带外回传数据。**
+ *
+ * 原实现只正则查了「是不是 http/https」就直接 `sendBytes`。但本函数拿到的 URL
+ * 来自**上游响应体**，不属于 `routes/proxy.ts` 那三道闸的保护范围（它们只管
+ * 客户端传进来的 URL）。于是恶意/被攻破的中转站只要返回
+ * `{"data":[{"url":"http://169.254.169.254/latest/meta-data/iam/security-credentials/"}]}`，
+ * 服务端就去抓 → `persistResults` 落成 `image:` 资产 → 用户在画布里把云账号凭据下载回来。
+ * 这不是盲 SSRF，而是「读得到响应 + 响应会被持久化 + 用户可取回」的完整链路。
+ *
+ * 现在复用与代理同一套闸门，白名单取 `RESULT_DOWNLOAD_ALLOWLIST`
+ * （结果 CDN 域名通常与 API 域名不同，不能套用渠道 baseUrl 白名单）。
  */
 export async function downloadBytes(ctx: ProviderContext, url: string): Promise<{ bytes: Uint8Array; mime: string }> {
-    if (!/^https?:\/\//i.test(url)) {
-        throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游返回了不受支持的下载地址：${url.slice(0, 80)}`, { retryable: false });
-    }
+    await assertResultUrlAllowed(url);
     return sendBytes(ctx, { url, method: "GET", headers: {} });
+}
+
+/**
+ * 校验「上游返回的结果下载地址」是否允许访问。
+ *
+ * 与 `routes/proxy.ts` 的顺序严格一致：`checkTarget`（协议 + 字面量内网 + 白名单）
+ * → `resolveAndCheckHost`（DNS 复检）→ 才允许发请求。
+ * `RESULT_DOWNLOAD_ALLOWLIST` 留空时**拒绝一切**结果下载（fail-closed）。
+ */
+async function assertResultUrlAllowed(rawUrl: string): Promise<void> {
+    // 动态 import：本文件在模块加载期不许依赖 env（见文件头约束）。
+    const { getEnv } = await import("../env.ts");
+    const allowlist = new Set(getEnv().RESULT_DOWNLOAD_ALLOWLIST);
+
+    const target = checkTarget(rawUrl, allowlist);
+    if (!target.ok) {
+        throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游返回了不允许的结果下载地址：${target.reason}`, {
+            retryable: false,
+        });
+    }
+
+    const hostCheck = await resolveAndCheckHost(target.url.hostname);
+    if (!hostCheck.ok) {
+        throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游返回了不允许的结果下载地址：${hostCheck.reason}`, {
+            retryable: false,
+        });
+    }
 }
 
 /** 把网络层异常翻译成适配器错误。 */

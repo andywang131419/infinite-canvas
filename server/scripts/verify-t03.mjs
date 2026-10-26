@@ -858,6 +858,86 @@ check("IPv4/IPv6 网段判定（保留段逐项）", () => {
     assert(!guard.isBlockedIpv6("2001:db8::1"), "公网 IPv6 被误判为禁止");
 });
 
+// QA R2 `P1-R2-3`：这里的补测是出于惨痛教训 —— 原先 IPv6 那一组恰好漏了
+// `::ffff:x:y`（十六进制对写法），而漏洞正好压在测试盲区上。
+check("IPv4-mapped 十六进制写法（::ffff:7f00:1 一族）必须拦住", () => {
+    // WHATWG URL 会把 `[::ffff:127.0.0.1]` 规范化成 `[::ffff:7f00:1]`。
+    for (const ip of ["::ffff:7f00:1", "::ffff:a9fe:a9fe", "::ffff:0a00:1", "::ffff:c0a8:101", "0:0:0:0:0:ffff:7f00:1"]) {
+        assert(guard.isBlockedIpv6(ip), `IPv4-mapped ${ip} 未被判为禁止（fail-open 回归）`);
+    }
+    // 公网 IPv6 不能被误伤（fail-closed 的反向风险）。
+    for (const ip of ["2001:db8::1", "2606:4700::6810:85e5", "2400:3200::1"]) {
+        assert(!guard.isBlockedIpv6(ip), `公网 IPv6 ${ip} 被误判为禁止`);
+    }
+    // 判不明的畸形写法一律按禁止处理。
+    for (const ip of ["", ":", "::::", "::zz"]) {
+        assert(guard.isBlockedIpv6(ip), `畸形 IPv6 ${JSON.stringify(ip)} 未被判为禁止（应 fail-closed）`);
+    }
+});
+
+check("IPv4-mapped 端到端：即使主机在白名单里也拒绝", () => {
+    const permissive = new Set(["::ffff:7f00:1", "::ffff:a9fe:a9fe"]);
+    for (const target of [
+        "http://[::ffff:127.0.0.1]:8080/x",
+        "http://[::ffff:7f00:1]:8080/x",
+        "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        "http://[::ffff:a9fe:a9fe]/latest/meta-data/",
+    ]) {
+        const result = guard.checkTarget(target, permissive);
+        assert(!result.ok, `${target} 被放行（可用 metadata SSRF）`);
+    }
+});
+
+// QA R2 `P1-R2-2`：`downloadBytes()` 过去只查协议就直传，构成带外回传的完整 SSRF
+// （上游返回内网 URL → 服务端抓取 → 落成画布资产 → 用户下载回来）。
+await checkAsync("downloadBytes：结果下载地址必须过 guard + 白名单", async () => {
+    const { downloadBytes } = await import("../src/providers/http.ts");
+    const { resetEnvCache } = await import("../src/env.ts");
+
+    process.env.RESULT_DOWNLOAD_ALLOWLIST = "cdn.example.com";
+    resetEnvCache();
+
+    const ctx = {
+        format: "openai",
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-unit-test-not-a-real-key",
+        model: "unit",
+        timeoutMs: 1500,
+    };
+
+    for (const url of [
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://127.0.0.1:8787/api/canvases",
+        "file:///etc/passwd",
+        "http://evil.example-steal.test/a.png",
+        "http://[::ffff:a9fe:a9fe]/latest/meta-data/",
+    ]) {
+        let threw = null;
+        try {
+            await downloadBytes(ctx, url);
+        } catch (error) {
+            threw = error;
+        }
+        assert(threw !== null, `${url} 未被守卫拦截`);
+        assert(
+            String(threw?.message ?? "").includes("不允许的结果下载地址"),
+            `${url} 被拦截但不是守卫拦的：${threw?.message}`,
+        );
+    }
+
+    // 反向：白名单内的主机不能因为守卫而被拒（网络层的失败是另一回事）。
+    let rejectedByGuard = false;
+    try {
+        await downloadBytes(ctx, "https://cdn.example.com/a.png");
+    } catch (error) {
+        rejectedByGuard = String(error?.message ?? "").includes("不允许的结果下载地址");
+    }
+    assert(!rejectedByGuard, "白名单内的结果地址被守卫误拒，正常功能会挂");
+
+    delete process.env.RESULT_DOWNLOAD_ALLOWLIST;
+    resetEnvCache();
+});
+
 // ---------------------------------------------------------------------------
 // [5] SSE 心跳
 // ---------------------------------------------------------------------------

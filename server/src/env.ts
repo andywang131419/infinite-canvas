@@ -88,6 +88,25 @@ const envSchema = z.object({
                 .map((item) => item.trim().toLowerCase())
                 .filter(Boolean),
         ),
+    /**
+     * 结果下载地址白名单（QA R2 `P1-R2-2`）。
+     *
+     * 为什么单开一份：`downloadBytes()` 取的是**上游响应里返回的 URL**，
+     * 而图表/视频结果的 CDN 域名通常与调用 API 的域名不同
+     * （例如调用 `api.xxx.com`、结果落在 `cdn.xxx.com` 或对象存储域名）。
+     * 若直接套用 `UPSTREAM_HOST_ALLOWLIST`（渠道 baseUrl 主机），正常结果会下不来。
+     *
+     * 留空 = 拒绝一切结果下载。首次上线时观察服务端日志里的拒绝原因再逐项加。
+     */
+    RESULT_DOWNLOAD_ALLOWLIST: z
+        .string()
+        .default("")
+        .transform((value) =>
+            value
+                .split(",")
+                .map((item) => item.trim().toLowerCase())
+                .filter(Boolean),
+        ),
 
     // ===== 备份 =====
     // cron 侧的实际执行在 backup 容器（deploy/backup/backup.sh）；

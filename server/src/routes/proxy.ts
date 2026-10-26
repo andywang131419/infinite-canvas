@@ -52,7 +52,7 @@ const FORWARDABLE_HEADERS = new Set(["content-type", "accept", "accept-language"
 const proxySchema = z.object({
     /** 绝对 URL（必须带协议）。 */
     url: z.string().min(1).max(2048),
-    method: z.enum(["GET", "POST"]).optional(),
+    method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional(),
     /** 可选：显式指定用哪个渠道的密钥。省略时按主机名匹配。 */
     channelId: z.string().min(1).max(64).optional(),
     /** 透传的请求头（只接受白名单内的键）。 */
@@ -60,6 +60,23 @@ const proxySchema = z.object({
     /** JSON body（对象/数组）；字符串会被原样当 JSON 文本发出去。 */
     body: z.unknown().optional(),
 });
+
+/**
+ * 字节透传分支的判定：带 `?url=` 且 `content-type` 是 multipart / octet-stream。
+ *
+ * 为什么单独开一条路（而不是把 multipart 塞进 JSON 信封）：
+ * 图生图 `/images/edits`、视频 `/videos` 这类接口的请求体是**二进制 + boundary**，
+ * 一旦经过 `JSON.stringify` 就再也还原不回去（base64 化会让体积膨胀 33% 且上游不认）。
+ * 所以这条分支只搬运原始字节，不做任何解析。
+ */
+const BYTE_CONTENT_TYPES = ["multipart/form-data", "application/octet-stream"];
+
+/** 判定当前请求是否走字节透传分支。 */
+function isBytePassthrough(rawUrl: string | undefined, contentType: string): boolean {
+    if (!rawUrl) return false;
+    const lower = contentType.toLowerCase();
+    return BYTE_CONTENT_TYPES.some((prefix) => lower.startsWith(prefix));
+}
 
 /**
  * 直通代理。
@@ -70,6 +87,31 @@ const proxySchema = z.object({
  */
 proxyRoutes.post("/proxy", async (c) => {
     const user = currentUser(c);
+
+    // ---- 字节透传分支（T04-A3）：multipart / octet-stream 原样搬运 ----
+    const rawUrl = c.req.query("url");
+    const rawContentType = c.req.header("content-type") ?? "";
+    if (isBytePassthrough(rawUrl, rawContentType)) {
+        const declaredLength = Number(c.req.header("content-length") ?? "0");
+        const limit = bytePassthroughLimit();
+        if (declaredLength > limit) {
+            throw new ApiError("VALIDATION_FAILED", `请求体超过 ${limit} 字节上限（multipart 透传）`);
+        }
+
+        const body = await c.req.arrayBuffer();
+        if (body.byteLength > limit) {
+            throw new ApiError("VALIDATION_FAILED", `请求体超过 ${limit} 字节上限（multipart 透传）`);
+        }
+
+        return await proxyBytes({
+            ownerId: user.id,
+            rawUrl: rawUrl as string,
+            contentType: rawContentType,
+            channelId: c.req.query("channelId") ?? null,
+            body,
+        });
+    }
+
     const raw = await readJsonBody<unknown>(c, PROXY_BODY_LIMIT);
 
     const parsed = proxySchema.safeParse(raw);
@@ -161,6 +203,84 @@ proxyRoutes.get("/proxy", (c) => {
     });
 });
 
+/** 字节透传分支的体积上限（与 `PUT /api/canvases/:id` 同口径）。 */
+function bytePassthroughLimit(): number {
+    return getEnv().MAX_UPLOAD_MB * 1024 * 1024;
+}
+
+/** 字节透传的输入（刻意用纯数据结构，便于单测直接构造）。 */
+type ByteProxyInput = {
+    ownerId: string;
+    rawUrl: string;
+    contentType: string;
+    channelId: string | null;
+    body: ArrayBuffer;
+};
+
+/**
+ * 原始字节透传（multipart / octet-stream）。
+ *
+ * 存在理由：`/images/edits`、`/videos` 这类接口的请求体带 boundary，
+ * 一旦经过 JSON 信封就再也还原不回去，所以这条分支只搬运字节、不做解析。
+ *
+ * **安全底线与 JSON 分支完全对齐，一步都不能少**：
+ * 1. `checkTarget` —— 协议 + 字面量内网 + 主机白名单；
+ * 2. `resolveAndCheckHost` —— DNS 复检（防 `nip.io` 这类域名 evade）；
+ * 3. 客户端的 `authorization` / `cookie` / `host` 一律不接受，密钥由服务端注入；
+ * 4. `redirect: "manual"` —— 跟随重定向会绕过全部校验。
+ *
+ * 注意这两步**必须**调用：少任何一步，整条分支就退化成第二个 `downloadBytes`
+ * （QA R2 `P1-R2-2` 同类的完整 SSRF）。
+ */
+async function proxyBytes(input: ByteProxyInput): Promise<Response> {
+    const allowlist = buildAllowlist(input.ownerId);
+
+    // ---- 闸门 1/2：与 JSON 分支同源、同序 ----
+    const target = checkTarget(input.rawUrl, allowlist);
+    if (!target.ok) {
+        throw new ApiError("FORBIDDEN", `代理目标被拒绝：${target.reason}`, { url: redactUrl(input.rawUrl) });
+    }
+
+    // ---- 闸门 3：DNS 解析后再次确认不是内网 ----
+    const hostCheck = await resolveAndCheckHost(target.url.hostname);
+    if (!hostCheck.ok) {
+        throw new ApiError("FORBIDDEN", `代理目标被拒绝：${hostCheck.reason}`, { host: normalizeHost(target.url.hostname) });
+    }
+
+    // ---- 请求头：只保留 multipart 的 content-type（含 boundary），其余一律丢弃 ----
+    const headers = new Headers();
+    headers.set("content-type", input.contentType);
+    headers.set("accept", "*/*");
+
+    injectUpstreamAuth(input.ownerId, target.url.hostname, input.channelId, headers);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
+
+    let upstream: Response;
+    try {
+        upstream = await fetch(target.url.toString(), {
+            method: "POST",
+            headers,
+            body: input.body.byteLength > 0 ? input.body : undefined,
+            signal: controller.signal,
+            redirect: "manual",
+        });
+    } catch (error) {
+        clearTimeout(timer);
+        const message = error instanceof Error && error.name === "AbortError" ? "上游请求超时" : "无法连接上游";
+        throw new ApiError("PROVIDER_UPSTREAM_ERROR", `${message}（${normalizeHost(target.url.hostname)}）`);
+    }
+
+    clearTimeout(timer);
+    const bytes = new Uint8Array(await upstream.arrayBuffer());
+
+    return new Response(bytes, {
+        status: upstream.status,
+        headers: passthroughHeaders(upstream),
+    });
+}
+
 /**
  * 组装白名单：启用渠道的 baseUrl 主机 ∪ `UPSTREAM_HOST_ALLOWLIST`。
  *
@@ -211,6 +331,9 @@ function passthroughHeaders(upstream: Response): Record<string, string> {
     const retryAfter = upstream.headers.get("retry-after");
     if (retryAfter) result["Retry-After"] = retryAfter;
     result["Cache-Control"] = "no-store";
+    // QA R2 `P2-R2-5`：Content-Type 由上游决定，不可控。
+    // 必须显式禁止 MIME 嗅探，否则被下发成 text/html 的响应会被渲染执行。
+    result["X-Content-Type-Options"] = "nosniff";
     return result;
 }
 

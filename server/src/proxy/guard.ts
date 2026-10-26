@@ -82,21 +82,42 @@ export function isBlockedIpv4(ip: string): boolean {
  * 判断 IPv6 是否属于禁止访问的网段。
  *
  * 覆盖：`::`（未指定）、`::1`（回环）、`fc00::/7`（唯一本地）、
- * `fe80::/10`（链路本地）、`ff00::/8`（组播）、`::ffff:a.b.c.d`（映射到 IPv4 后按 v4 规则判）。
+ * `fe80::/10`（链路本地）、`ff00::/8`（组播）、`::ffff:a.b.c.d` 与其
+ * **十六进制对写法**（映射到 IPv4 后一律按 v4 规则判）。
+ *
+ * ⚠️ QA R2 `P1-R2-3`：原先只认点分写法 `::ffff:127.0.0.1`，而 WHATWG URL
+ * 会把 `[::ffff:127.0.0.1]` 规范化成 `[::ffff:7f00:1]` —— 正则不匹配后落进
+ * `first.length === 0` 分支，而那个分支当时的语义是 **fail-open（返回 false）**。
+ * 实测 `http://[::ffff:a9fe:a9fe]/latest/meta-data/` 会被放行，第三道 DNS
+ * 复检也一并放行。这里同时做了两件事：正则补(s)见到十六进制对写法，兜底分支改 fail-closed。
  */
 export function isBlockedIpv6(ip: string): boolean {
     const value = normalizeHost(ip);
     if (value === "::" || value === "::1") return true;
 
-    // IPv4-mapped（`::ffff:127.0.0.1`）：拆出尾部按 v4 判，否则会被当成"公网 v6"。
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(value);
-    if (mapped) return isBlockedIpv4(mapped[1]!);
+    // IPv4-mapped 点分写法（`::ffff:127.0.0.1`）：拆出尾部按 v4 判。
+    const mappedDotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(value);
+    if (mappedDotted) return isBlockedIpv4(mappedDotted[1]!);
+
+    // IPv4-mapped 十六进制写法（`::ffff:7f00:1`、`0:0:0:0:0:ffff:7f00:1`）：
+    // 后两个 group 各承载两个字节，补足 4 位后拆成 4 个八位组。
+    const mappedHex = /^(?:::|(?:0+:)+)ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(value);
+    if (mappedHex) {
+        const high = (mappedHex[1] ?? "").padStart(4, "0");
+        const low = (mappedHex[2] ?? "").padStart(4, "0");
+        const dotted = [high.slice(0, 2), high.slice(2), low.slice(0, 2), low.slice(2)]
+            .map((octet) => Number.parseInt(octet, 16))
+            .join(".");
+        return isBlockedIpv4(dotted);
+    }
 
     const first = value.split(":")[0] ?? "";
-    if (first.length === 0) return value.startsWith(":") ? false : true;
+    // 走不到上面的任何分支，说明这串内容我们没能力判明安全与否。
+    // 安全控制必须 fail-closed：判不明就拒，`0000::/8` 本身也是 IANA 保留段。
+    if (first.length === 0) return true;
 
-    const head = parseInt(first, 16);
-    if (!Number.isFinite(head)) return false;
+    const head = Number.parseInt(first, 16);
+    if (!Number.isFinite(head)) return true;
     if ((head & 0xfe00) === 0xfc00) return true; // fc00::/7
     if ((head & 0xffc0) === 0xfe80) return true; // fe80::/10
     if ((head & 0xff00) === 0xff00) return true; // ff00::/8
