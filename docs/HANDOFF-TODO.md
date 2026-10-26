@@ -61,8 +61,15 @@ Pop-Location
 | `d935b95` | 修复批次：首次保存丢图 / 资产 MIME 白名单 / doc 清洗绕过 / 文本正文被清空 / 媒体备份 / 备份审计等 |
 | `eeeb882` | **安全修复**：SSRF 两处 + 补完 `proxyBytes` + nosniff |
 | `486557e` | `.env.example` 补 `RESULT_DOWNLOAD_ALLOWLIST` |
+| `673f3f8` | T04-A1 服务端 API 客户端 + AI 调用收口 |
+| `56ad859` | T04-A2 画布与资产双写同步 |
+| `e5709a9` | T04-A3 密钥只写 + 登录门 + 同步状态 UI |
+| `36ba044` | 任务收尾加 `attempt` 围栏 + 幂等键隔离（迁移 `0002`） |
+| `997435f` | 备份失败必须可见 + 统一布尔环境变量口径 |
 
-**尚未完成的 T04 前端改动停在工作区**（未提交、未验证，清单见 §2）。
+验收实测：server `tsc --noEmit` 0 error；`verify-t02` 66 组、`verify-t03` **68 组**、`verify-fix-p01` 27 组，全部 EXIT=0。
+
+**剩余**：web 侧 `tsc --noEmit` 有 15 处错误（缺 import 11 条 / 符号名写错 1 条 / store action 当自由函数调用 1 条 / 基线自带 1 条），工程师正在修。
 
 ---
 
@@ -219,3 +226,7 @@ Pop-Location
 
 - 2026-10-26 15:50　建立本文档。HEAD=`486557e`。两条 SSRF 已修（`eeeb882`）。
   待办：T04-A 27 个未提交文件、P1-R2-1、P1-R2-4、P1-R2-5、P2 七条。
+- 2026-10-26 16:4x　环境修复完成：bun 1.4.4 装到 `C:\Users\Administrator\.workbuddy\binaries\bun\bun-windows-x64\`，
+  `bun install` 重装 web 依赖 533 包成功 → **前端 typecheck 现在可以跑了**。
+  随即暴露 web 侧 15 处真实类型错误。**server 侧全部完成并通过验收。**
+  当前待办：web 侧 15 处类型错误（工程师修复中）→ 之后进 T04-B。
