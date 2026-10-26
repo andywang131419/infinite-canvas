@@ -12,6 +12,11 @@
  * 2. **恢复前必须先查再决定**：`listOpenJobs` 命中就 attach，绝不重新提交；
  * 3. 轮询必须能被 `AbortSignal` 取消，且取消时抛 `AbortError`
  *    （`isGenerationCanceled` 认这个名字）。
+ *
+ * 一条容易踩的边界：`open=true` 在服务端是 `status IN ('queued','running')`，
+ * **不含终态**。任务在页面卸载期间跑完的话不在这个列表里，所以恢复时还要用
+ * `getJob` 对着节点上存的 jobId 补捞一次（见 `fetchFinishedButUnclaimedJobs`），
+ * 否则已付费的结果会成孤儿。
  */
 
 import { apiDelete, apiGet, apiPost } from "../server-api";

@@ -253,11 +253,19 @@ SELECT * FROM jobs
  LIMIT ?
 `;
 
+/**
+ * 列出画布下未完成的任务。
+ *
+ * **倒序（新的在前）**。截断发生在 limit 上，方向决定了"哪些任务被丢掉"：
+ * 正序会保留最旧的一批，于是用户刚提交、正盯着看的那几个节点反而查不到、
+ * 被判成"已中断"；倒序保留最新的一批，被丢的是更早的 —— 那批用户多半已经
+ * 不在看了。和 `SQL_LIST_ALL` 保持同向，省得两处语义打架。
+ */
 export const SQL_LIST_OPEN = `
 SELECT * FROM jobs
  WHERE canvas_id = ?
    AND status IN ('queued', 'running')
- ORDER BY created_at ASC
+ ORDER BY created_at DESC
  LIMIT ?
 `;
 
@@ -551,9 +559,15 @@ export function listJobs(canvasId: string, limit = 50): JobRow[] {
     return getDb().query(SQL_LIST_ALL).all(canvasId, Math.min(Math.max(1, limit), 200)) as JobRow[];
 }
 
-/** 列出画布下未完成任务。 */
+/**
+ * 列出画布下未完成任务（倒序，新的在前）。
+ *
+ * 上限比 `listJobs` 放宽到 500：恢复是靠这个列表决定"哪些节点不许被标成已中断"，
+ * 漏一条就是一次"钱花了、图没了"。已经按 `canvas_id` 过滤过，单画布 500 条
+ * 未完成任务本身就是异常态，正常量级远低于此。
+ */
 export function listOpenJobsByCanvas(canvasId: string, limit = 50): JobRow[] {
-    return getDb().query(SQL_LIST_OPEN).all(canvasId, Math.min(Math.max(1, limit), 200)) as JobRow[];
+    return getDb().query(SQL_LIST_OPEN).all(canvasId, Math.min(Math.max(1, limit), 500)) as JobRow[];
 }
 
 /** 未完成任务数。 */

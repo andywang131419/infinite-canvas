@@ -698,6 +698,27 @@ check("列表/取消：open=true 只含 queued|running，取消只作用于未�
     db.close();
 });
 
+// 截断发生在 LIMIT 上，所以 ORDER BY 的方向决定了"哪些任务被丢掉"。
+// 正序会保留最旧的一批 —— 用户刚提交、正盯着看的节点反而查不到，被判成"已中断"，
+// 而服务端其实还在跑（钱花了、用户以为失败了）。
+check("列表：open 列表超限截断时必须保留**最新**的任务", () => {
+    const { db } = createQueueDb();
+    const oldest = insertJob(db, { id: "job_old_1" });
+    const middle = insertJob(db, { id: "job_old_2" });
+    const newest = insertJob(db, { id: "job_new_1" });
+    const setCreatedAt = (id, value) => db.prepare("UPDATE jobs SET created_at = ? WHERE id = ?").run(value, id);
+    setCreatedAt(oldest.id, "2026-01-01T00:00:00.000Z");
+    setCreatedAt(middle.id, "2026-01-02T00:00:00.000Z");
+    setCreatedAt(newest.id, "2026-01-03T00:00:00.000Z");
+
+    const truncated = db.prepare(SQL.listOpen).all("cv_1", 2);
+    const ids = truncated.map((row) => row.id);
+    assertEqual(truncated.length, 2, `截断后应返回 2 条，实际 ${truncated.length}`);
+    assert(ids.includes(newest.id), `超限截断必须保留最新的任务，实际返回 ${ids.join(",")}`);
+    assert(!ids.includes(oldest.id), `超限截断应丢弃最旧的任务，实际返回 ${ids.join(",")}`);
+    db.close();
+});
+
 // 临时库文件在 Windows 上可能因句柄未完全释放而删不掉 —— 不影响断言结果。
 await rm(queueDir, { recursive: true, force: true }).catch(() => undefined);
 

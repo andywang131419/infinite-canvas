@@ -67,11 +67,14 @@ export function isRecoverableJobType(type: string | null | undefined): boolean {
 /**
  * 图像任务的幂等键。
  *
- * **必须稳定，绝不能随机**：刷新页面后走的是"先查 open jobs 再 attach"的恢复路径，
- * 但如果查不到（比如画布还没同步上去），会退化成重新提交 —— 此时只有稳定的键
- * 才能让服务端按 `(user_id, idempotency_key)` 去重（`server/src/jobs/queue.ts`
- * 的 `ux_jobs_idempotency_user`），返回已存在的那个 job 而不是再建一个。
- * 随机键 = 同一张图提交两次 = 上游扣两次费。
+ * **必须稳定，绝不能随机。** 服务端按 `(user_id, idempotency_key)` 唯一
+ * （`server/src/jobs/queue.ts` 的 `ux_jobs_idempotency_user`）去重：键相同就返回
+ * 已存在的那个 job，而不是再建一个。所以只要同一次生成被重复提交 —— 用户连点两下、
+ * 网络层重试了一次 POST、React 重渲染导致提交跑了第二遍 —— 只有稳定键能保证
+ * 上游只被调一次。随机键 = 同一张图提交两次 = 上游扣两次费。
+ *
+ * 注意**恢复路径不重新提交**：它只查 open jobs 再轮询写回（见 `attachOpenJobs`）。
+ * 稳定键防的是"同一个动作被提交两次"，不是"刷新后重新提交"。
  *
  * 粒度是 **每张图一个 job**：一次"生成 4 张"会产生 4 个 imageId，
  * 其中 2 张失败时要能单独重试那 2 张，所以 `nodeId` 只作归组键
