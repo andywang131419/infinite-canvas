@@ -1338,6 +1338,144 @@ check(`${tsFiles.length} 个 .ts 文件语法可解析`, () => {
 });
 
 // ---------------------------------------------------------------------------
+// [9] 备份审计 / 环境口径一致（QA R2 `P1-R2-5` + 队列类 P2）
+// ---------------------------------------------------------------------------
+
+section("[9] 备份审计：失败必须可见（QA R2 P1-R2-5）");
+
+const backupSource = readFileSync(join(repoRoot, "..", "deploy/backup/backup.sh"), "utf8");
+const composeSource = readFileSync(join(repoRoot, "..", "deploy/docker-compose.yml"), "utf8");
+const envSource = readFileSync(join(repoRoot, "src/env.ts"), "utf8");
+const httpSource = readFileSync(join(repoRoot, "src/providers/http.ts"), "utf8");
+
+/**
+ * 说明（诚实交代覆盖范围）：
+ * 本机**没有 bash / sqlite3 / gzip / rclone**，所以 backup.sh 无法真的跑起来
+ * （QA 用的"导出 bash 函数 + 替身注入失败"这套也要 bash）。下面这组是
+ * **源码级**断言，能证明分支与 SQL 列写对了，但**不能**替代真跑一次。
+ * 要真验证请在 Linux/macOS 上按 QA 的方式跑，或起一个装了 sqlite3 的容器。
+ */
+
+check("媒体目录缺失 + 要求打包 → 必须记 failed 并退出非 0", () => {
+    // 定位"要求打包媒体"那个分支，在其内部找 ! -d 的处理。
+    const block = /if is_truthy "\$INCLUDE_MEDIA"[\s\S]*?\nfi/.exec(backupSource);
+    assert(block, "backup.sh 找不到 is_truthy 分支");
+    const missingDir = /\[ ! -d "\$STORAGE_LOCAL_ROOT" \][\s\S]*?(record_audit[\s\S]*?)\n\s*FINISHED=1\s*\n\s*exit 1/.exec(block[0]);
+    assert(missingDir, "媒体目录缺失时没有走「记 failed + exit 1」");
+    assert(/record_audit "failed"/.test(missingDir[1]), "媒体目录缺失时记的不是 failed");
+});
+
+check("tar 失败 → 记 failed 并退出非 0（不再是 warn + 报成功）", () => {
+    // 注意嵌套：tar 成功分支里还有一个 `if [ "$MEDIA_FILES" -eq 0 ] ... fi`（8 空格缩进）。
+    // 所以这里锚定 **4 空格** 的 else/fi，避免被内层 fi 截断。
+    const elseBranch = /if tar -czf[\s\S]*?\n    else\n([\s\S]*?)\n    fi/.exec(backupSource);
+    assert(elseBranch, "tar 失败没有 else 分支");
+    assert(/record_audit "failed"/.test(elseBranch[1]), "tar 失败时记的不是 failed");
+    assert(/exit 1/.test(elseBranch[1]), "tar 失败没有以非 0 退出");
+    assert(!/已跳过/.test(elseBranch[1]), "tar 失败仍在「跳过」（会继续报 success）");
+});
+
+check("审计行带 media_expected：能区分「打包失败」与「有意不打包媒体」", () => {
+    assert(/INSERT INTO backups[\s\S]*?media_expected/.test(backupSource), "INSERT 里没有 media_expected 列");
+
+    // 所有 record_audit 调用点都必须带上第 6 个参数，否则又会出现
+    // "失败"与"有意关闭"审计行一模一样的问题。
+    const calls = [...backupSource.matchAll(/record_audit\s+("?(?:failed|success)"?)[^\n]*/g)].map((item) => item[0]);
+    assert(calls.length >= 5, `record_audit 调用点太少（${calls.length}），解析可能出错`);
+    for (const call of calls) {
+        const args = call.match(/"[^"]*"|\S+/g) ?? [];
+        // 第 1 个 token 是函数名本身，之后才是参数。
+        assert(args.length >= 7, `record_audit 缺少 media_expected 参数：${call}`);
+    }
+});
+
+check("有意关闭媒体 → 记 media_expected=0（与失败区分开）", () => {
+    assert(/BACKUP_INCLUDE_MEDIA 为假/.test(backupSource) || /有意只备份数据库/.test(backupSource), "缺少「有意关闭媒体」的日志分支");
+    const successCall = /record_audit "success"[^\n]*/.exec(backupSource);
+    assert(successCall, "找不到 success 审计调用");
+    assert(/\$MEDIA_EXPECTED/.test(successCall[0]), "success 审计行没带 MEDIA_EXPECTED");
+});
+
+check("backup.sh 与 env.ts 认同一套布尔词表（口径一致）", () => {
+    // backup.sh 的 is_truthy
+    const shellMatch = /case[\s\S]*?(true \| 1 \| yes \| on)[\s\S]*?esac/.exec(backupSource);
+    assert(shellMatch, "backup.sh 找不到 is_truthy 的 case 分支");
+    const shellTrueWords = shellMatch[1].split("|").map((word) => word.trim());
+
+    // env.ts 的 TRUE_WORDS
+    const tsMatch = /const TRUE_WORDS = \[([^\]]+)\]/.exec(envSource);
+    assert(tsMatch, "env.ts 找不到 TRUE_WORDS");
+    const tsTrueWords = [...tsMatch[1].matchAll(/"([^"]+)"/g)].map((item) => item[1]);
+
+    assertEqual(
+        shellTrueWords.slice().sort().join(","),
+        tsTrueWords.slice().sort().join(","),
+        "两侧布尔真值词表不一致（一边认为开了、另一边认为关了）",
+    );
+});
+
+// 真跑一次的断言：这个不需要 bash，能直接验证 QA 说的"写 0/yes 会让 server 启动崩溃"。
+// `resetEnvCache` 在 [1] 段已经导入过，这里只补 getEnv。
+const { getEnv } = await import("../src/env.ts");
+
+function boolEnvProbe(value) {
+    const previous = process.env.COOKIE_SECURE;
+    process.env.COOKIE_SECURE = value;
+    resetEnvCache();
+    try {
+        return { ok: true, value: getEnv().COOKIE_SECURE };
+    } catch (error) {
+        return { ok: false, error };
+    } finally {
+        if (previous === undefined) delete process.env.COOKIE_SECURE;
+        else process.env.COOKIE_SECURE = previous;
+        resetEnvCache();
+    }
+}
+
+check("布尔环境变量：0 / yes / on 都能解析（不再让 server 启动崩溃）", () => {
+    assertEqual(boolEnvProbe("0").value, false, "写 0 未解析为 false");
+    assertEqual(boolEnvProbe("no").value, false, "写 no 未解析为 false");
+    assertEqual(boolEnvProbe("off").value, false, "写 off 未解析为 false");
+    assertEqual(boolEnvProbe("1").value, true, "写 1 未解析为 true");
+    assertEqual(boolEnvProbe("yes").value, true, "写 yes 未解析为 true");
+    assertEqual(boolEnvProbe("ON").value, true, "写 ON（大写）未解析为 true");
+    assertEqual(boolEnvProbe(" True ").value, true, "写 ' True '（带空格）未解析为 true");
+});
+
+check("布尔环境变量：无法判定的值仍然 fail-fast（不悄悄当 false）", () => {
+    const result = boolEnvProbe("maybe");
+    assertEqual(result.ok, false, "写 maybe 竟然通过了校验 —— 会被悄悄当成 false，等于静默关掉功能");
+});
+
+check("docker-compose：server 服务注入了 BACKUP_INCLUDE_MEDIA", () => {
+    const serverBlock = /\n    server:[\s\S]*?\n    \S/.exec(composeSource);
+    assert(serverBlock, "docker-compose 找不到 server 服务");
+    assert(/BACKUP_INCLUDE_MEDIA:/.test(serverBlock[0]), "server 服务仍缺少 BACKUP_INCLUDE_MEDIA（两边口径会对不上）");
+});
+
+check("docker-compose：server 服务注入了 RESULT_DOWNLOAD_ALLOWLIST", () => {
+    const serverBlock = /\n    server:[\s\S]*?\n    \S/.exec(composeSource);
+    assert(serverBlock, "docker-compose 找不到 server 服务");
+    // 不注入的话 server 容器里它恒为空 = 拒绝一切结果下载 = "生成成功但画布无图"。
+    assert(/RESULT_DOWNLOAD_ALLOWLIST:/.test(serverBlock[0]), "server 服务缺少 RESULT_DOWNLOAD_ALLOWLIST（结果下载会被永久 fail-closed 阻断）");
+});
+
+check("sendRequest：先看 content-length 再读 body（512MB 上限真的能防住）", () => {
+    // 旧实现：先 arrayBuffer() 再判 —— 字节已经在内存里了，"防 2GB 读死进程"是空话。
+    assert(/content-length/.test(httpSource), "sendRequest 没有读 content-length");
+    assert(/readBodyWithLimit/.test(httpSource), "sendRequest 没有走流式限量读取");
+
+    const sendRequest = /export async function sendRequest[\s\S]*?\n}/.exec(httpSource);
+    assert(sendRequest, "找不到 sendRequest");
+    const limitCheckAt = sendRequest[0].indexOf("declaredLength > MAX_RESPONSE_BYTES");
+    const readAt = sendRequest[0].indexOf("readBodyWithLimit");
+    assert(limitCheckAt > 0, "sendRequest 里没有 content-length 超限判断");
+    assert(readAt > 0, "sendRequest 里没有限量读取");
+    assert(limitCheckAt < readAt, "超限判断写在读取之后 —— 上限形同虚设（字节已进内存）");
+});
+
+// ---------------------------------------------------------------------------
 // 汇总
 // ---------------------------------------------------------------------------
 

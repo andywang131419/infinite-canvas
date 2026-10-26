@@ -26,6 +26,10 @@ KEEP_DAYS="${BACKUP_DB_KEEP_DAYS:-14}"
 RETRY="${BACKUP_RETRY:-3}"
 # 默认 true：媒体就是用户真正的数据，恢复时缺了它画布里全是 404（QA P1-3）。
 INCLUDE_MEDIA="${BACKUP_INCLUDE_MEDIA:-true}"
+# 与 INCLUDE_MEDIA 同源，但归一成 0/1 写进审计行的 media_expected 列。
+# 判定函数 `is_truthy` 定义在下面（POSIX sh 顺序解析），所以这里先占位，
+# 在真正用到之前（第 3 步媒体打包前）再算一次。
+MEDIA_EXPECTED=0
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 RCLONE_DEST="${RCLONE_DEST:-}"
 TARGET_LABEL="${BACKUP_TARGET_LABEL:-}"
@@ -40,16 +44,42 @@ err() { printf '%s ERROR %s\n' "$LOG_PREFIX" "$*" >&2; }
 sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
 
 # -----------------------------------------------------------------------------
+# 布尔值判定（QA R2 `P1-R2-5` 的配套项）
+#
+# 必须与 server/src/env.ts 的 boolFromEnv 认同一套写法，否则会出现
+# "server 认为开了媒体备份、backup.sh 却关着"（或反过来）的口径分裂。
+# 以前 backup.sh 只认精确的 "true"，于是写 1 / yes / True 全被当 false，
+# 而 env.ts 那边是 z.enum(["true","false"]) —— 写 0/yes 直接让 server 启动崩溃。
+# 两边现在都认：真 = true|1|yes|on，假 = false|0|no|off（空串按各自的默认值）。
+# -----------------------------------------------------------------------------
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        true | 1 | yes | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # 审计记录：往 backups 表插一行，供设置页展示。
 # best-effort —— 失败只告警，不影响备份文件本身的有效性。
 # 注意：必须定义在所有调用点之前（POSIX sh 顺序解析）。
 # -----------------------------------------------------------------------------
+#
+# 第 6 个参数 `media_expected`（QA R2 `P1-R2-5`）：
+#   1 = 本次本来就该打包媒体 —— 于是 media_files=0 是**异常**，status 必须是 failed；
+#   0 = 有意只备份数据库（BACKUP_INCLUDE_MEDIA 为假）—— media_files=0 是**预期**。
+#
+# 没有这一列时，"tar 失败"与"有意关闭媒体"产生的审计行一模一样
+# （status=success, media_files=0），运维从设置页完全看不出媒体其实没备份
+# —— 正是 P1-3 想消灭的失败模式：媒体零备份但系统全绿，等恢复时才发现图全 404。
+# 列由 migrations/0002_job_fencing.sql 添加。
 record_audit() {
     audit_status="$1"
     audit_db_bytes="$2"
     audit_media_files="$3"
     audit_media_bytes="$4"
     audit_err="$5"
+    audit_media_expected="${6:-0}"
 
     [ -f "$DATABASE_PATH" ] || return 0
     command -v sqlite3 >/dev/null 2>&1 || return 0
@@ -62,8 +92,8 @@ record_audit() {
 
     sqlite3 "$DATABASE_PATH" <<SQL 2>/dev/null || warn "审计写入失败（不影响备份文件）"
 PRAGMA busy_timeout = 5000;
-INSERT INTO backups (id, trigger, status, db_bytes, media_files, media_bytes, target, error_message, started_at, finished_at)
-VALUES ('$audit_id', 'cron', '$audit_status_esc', ${audit_db_bytes:-0}, ${audit_media_files:-0}, ${audit_media_bytes:-0}, '$audit_target', NULLIF('$audit_errmsg',''), '$audit_now', '$audit_now');
+INSERT INTO backups (id, trigger, status, db_bytes, media_files, media_bytes, media_expected, target, error_message, started_at, finished_at)
+VALUES ('$audit_id', 'cron', '$audit_status_esc', ${audit_db_bytes:-0}, ${audit_media_files:-0}, ${audit_media_bytes:-0}, ${audit_media_expected:-0}, '$audit_target', NULLIF('$audit_errmsg',''), '$audit_now', '$audit_now');
 SQL
 }
 
@@ -95,7 +125,7 @@ on_exit() {
     cleanup
     if [ "$FINISHED" -ne 1 ]; then
         if [ -n "$DB_OUT" ]; then rm -f "$DB_OUT" 2>/dev/null || true; fi
-        record_audit "failed" 0 0 0 "aborted (exit=$status)"
+        record_audit "failed" 0 0 0 "aborted (exit=$status)" "$MEDIA_EXPECTED"
         err "备份异常中断（exit=$status），已写入 failed 审计行并清理半截产物"
     fi
 }
@@ -142,7 +172,7 @@ done
 
 if [ "$ok" -ne 1 ]; then
     err "快照连续失败 $RETRY 次，放弃本次备份"
-    record_audit "failed" 0 0 0 "snapshot failed after $RETRY attempts"
+    record_audit "failed" 0 0 0 "snapshot failed after $RETRY attempts" "$MEDIA_EXPECTED"
     FINISHED=1
     exit 1
 fi
@@ -159,16 +189,39 @@ log "已生成 $DB_OUT（压缩后 $DB_BYTES bytes）"
 # -----------------------------------------------------------------------------
 MEDIA_FILES=0
 MEDIA_BYTES=0
-if [ "$INCLUDE_MEDIA" = "true" ] && [ -d "$STORAGE_LOCAL_ROOT" ]; then
+if is_truthy "$INCLUDE_MEDIA"; then MEDIA_EXPECTED=1; fi
+
+if [ "$MEDIA_EXPECTED" -eq 1 ]; then
+    # 【QA R2 P1-R2-5】要求打包却找不到目录 —— 多半是卷没挂上或 STORAGE_LOCAL_ROOT 配错。
+    # 以前只是静默跳过，最终审计行仍是 status=success、media_files=0，
+    # 与"有意只备份数据库"完全无法区分。现在判失败并退出。
+    if [ ! -d "$STORAGE_LOCAL_ROOT" ]; then
+        err "媒体目录不存在：$STORAGE_LOCAL_ROOT（BACKUP_INCLUDE_MEDIA 为真却找不到目录，检查卷挂载与 STORAGE_LOCAL_ROOT）"
+        record_audit "failed" "$DB_BYTES" 0 0 "media directory missing: $STORAGE_LOCAL_ROOT" 1
+        FINISHED=1
+        exit 1
+    fi
+
     MEDIA_OUT="$STAGE_DIR/media-$STAMP.tar.gz"
     log "打包媒体目录 $STORAGE_LOCAL_ROOT → $MEDIA_OUT"
     if tar -czf "$MEDIA_OUT" -C "$(dirname "$STORAGE_LOCAL_ROOT")" "$(basename "$STORAGE_LOCAL_ROOT")"; then
         MEDIA_FILES="$(find "$STORAGE_LOCAL_ROOT" -type f | wc -l | tr -d ' ')"
         MEDIA_BYTES="$(wc -c < "$MEDIA_OUT" | tr -d ' ')"
         log "媒体打包完成：$MEDIA_FILES 个文件，$MEDIA_BYTES bytes"
+        # 目录存在却一个文件都没有：多半是挂了空卷。不判失败，但要让人看见。
+        if [ "$MEDIA_FILES" -eq 0 ]; then
+            warn "媒体目录存在但为空（0 个文件），请确认卷是否真的挂上了"
+        fi
     else
-        warn "媒体打包失败，已跳过（数据库备份仍然有效）"
+        # 【QA R2 P1-R2-5】tar 失败不再"跳过并报成功"。
+        err "媒体打包失败（数据库快照仍然有效，但本次备份不完整）"
+        record_audit "failed" "$DB_BYTES" 0 0 "media tar failed" 1
+        FINISHED=1
+        exit 1
     fi
+else
+    # 有意关闭：审计行 media_expected=0，与上面的"失败"区分开。
+    log "BACKUP_INCLUDE_MEDIA 为假 → 有意只备份数据库（媒体零备份，恢复后画布里的图会 404）"
 fi
 
 # -----------------------------------------------------------------------------
@@ -183,7 +236,7 @@ log "清理超过 ${KEEP_DAYS} 天的本地备份：$REMOVED 个"
 if [ -n "$RCLONE_REMOTE" ]; then
     if ! command -v rclone >/dev/null 2>&1; then
         err "RCLONE_REMOTE 已设置但找不到 rclone 命令"
-        record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone missing"
+        record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone missing" "$MEDIA_EXPECTED"
         FINISHED=1
         exit 1
     fi
@@ -195,7 +248,7 @@ if [ -n "$RCLONE_REMOTE" ]; then
         log "上传完成"
     else
         err "rclone 上传失败（本地备份已保留，可人工补传）"
-        record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone upload failed"
+        record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone upload failed" "$MEDIA_EXPECTED"
         FINISHED=1
         exit 1
     fi
@@ -203,7 +256,7 @@ else
     log "未配置 RCLONE_REMOTE → 仅本地备份（$STAGE_DIR）"
 fi
 
-record_audit "success" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" ""
+record_audit "success" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "" "$MEDIA_EXPECTED"
 FINISHED=1
 log "备份成功"
 exit 0

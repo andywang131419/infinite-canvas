@@ -10,12 +10,35 @@
 
 import { z } from "zod";
 
-/** 布尔型环境变量：只接受 "true" / "false" 字符串。 */
+/**
+ * 布尔型环境变量的两种写法（大小写与首尾空格都忽略）。
+ *
+ * **QA R2 队列类 P2**：以前只认精确的 `"true"` / `"false"`，写 `0` / `yes` / `on`
+ * 会让**服务端在启动期直接崩**（zod enum 校验失败 → 进程退出），而另一边的
+ * `deploy/backup/backup.sh` 用的是 `[ "$X" = "true" ]`，同样把 `1`/`yes` 当成 false。
+ * 同一个 `BACKUP_INCLUDE_MEDIA` 两边口径不一致，是那种"改一处忘另一处"的典型坑。
+ *
+ * 现在两边（`backup.sh` 的 `is_truthy`）认**同一套**词表。
+ * 仍然 fail-fast：写 `maybe` 这种无法判定的值依旧启动失败，
+ * 而不是悄悄当成 false —— 后者会让"我明明开了媒体备份"变成静默的数据丢失。
+ */
+const TRUE_WORDS = ["true", "1", "yes", "on"];
+const FALSE_WORDS = ["false", "0", "no", "off"];
+
+/** 归一化后是否属于可识别的布尔写法。 */
+function isBoolWord(raw: string): boolean {
+    const value = raw.trim().toLowerCase();
+    return TRUE_WORDS.includes(value) || FALSE_WORDS.includes(value);
+}
+
 const boolFromEnv = (fallback: boolean) =>
     z
-        .enum(["true", "false"])
+        .string()
         .default(fallback ? "true" : "false")
-        .transform((value) => value === "true");
+        .refine(isBoolWord, {
+            message: `布尔型环境变量只能取 ${TRUE_WORDS.join("/")} 或 ${FALSE_WORDS.join("/")}（不区分大小写）`,
+        })
+        .transform((raw) => TRUE_WORDS.includes(raw.trim().toLowerCase()));
 
 /** 整数型环境变量：正整数，越界即启动失败。 */
 const intFromEnv = (fallback: number, min = 1) => z.coerce.number().int().min(min).default(fallback);

@@ -118,6 +118,15 @@ services:
             BACKUP_DB_KEEP_DAYS: ${BACKUP_DB_KEEP_DAYS:-14}
             BACKUP_RETRY: ${BACKUP_RETRY:-3}
             BACKUP_TARGET_LABEL: ${BACKUP_TARGET_LABEL:-}
+            # 【QA R2 队列类 P2】此前只注入了 backup 服务、没注入 server，于是
+            # server 侧永远取默认值，两个容器的口径可能对不上。
+            # 两边共用同一个变量，避免"server 以为会打包媒体、backup.sh 其实没打包"
+            # （tar 由 backup.sh 做，审计行由两边共同读写）。
+            BACKUP_INCLUDE_MEDIA: ${BACKUP_INCLUDE_MEDIA:-true}
+            # 【必传】结果下载地址白名单。留空 = 拒绝一切结果下载，
+            # 表现为"生成成功但画布里没有图"。不注入的话 server 容器里它恒为空，
+            # 等于把 P1-R2-2 的 fail-closed 变成永久阻断。
+            RESULT_DOWNLOAD_ALLOWLIST: ${RESULT_DOWNLOAD_ALLOWLIST:-}
         volumes:
             - data:/data
         expose:

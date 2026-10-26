@@ -208,21 +208,81 @@ export async function sendRequest(ctx: ProviderContext, request: ProviderRequest
     }
 
     const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
-    let bytes: Uint8Array;
-    try {
-        bytes = new Uint8Array(await response.arrayBuffer());
-    } catch (error) {
-        throw normalizeNetworkError(error, request.url);
-    }
 
-    if (bytes.byteLength > MAX_RESPONSE_BYTES) {
-        throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游响应体过大（>${Math.floor(MAX_RESPONSE_BYTES / 1024 / 1024)}MB）`, {
+    // **先判大小，再读字节**（QA R2 队列类 P2）。
+    // 旧实现是 `await response.arrayBuffer()` 之后才比 MAX_RESPONSE_BYTES ——
+    // 也就是说"防上游返回 2GB 把进程读死"这条注释根本防不住：
+    // 字节早就在内存里了，判断只是事后拒绝，进程该 OOM 还是 OOM。
+    //
+    // 两道闸：
+    //   1. `content-length` 声明超限 → 立刻放弃，一个字节都不读；
+    //   2. 声明缺失（chunked / 上游不老实）→ 边读边累计，超了就 cancel 流。
+    const declaredLength = Number(response.headers.get("content-length") ?? "");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+        // 尽快释放连接，别让上游继续推完整个 body。
+        await response.body?.cancel().catch(() => undefined);
+        throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游响应体过大（声明 ${Math.floor(declaredLength / 1024 / 1024)}MB > ${Math.floor(MAX_RESPONSE_BYTES / 1024 / 1024)}MB）`, {
             retryable: false,
             status: response.status,
         });
     }
 
+    let bytes: Uint8Array;
+    try {
+        bytes = await readBodyWithLimit(response, MAX_RESPONSE_BYTES);
+    } catch (error) {
+        if (error instanceof ProviderError) throw error;
+        throw normalizeNetworkError(error, request.url);
+    }
+
     return { status: response.status, contentType, bytes, text: new TextDecoder().decode(bytes) };
+}
+
+/**
+ * 流式读响应体，累计超过 `limit` 就立刻停止并抛错。
+ *
+ * 与 `await response.arrayBuffer()` 的区别：这里是**边读边判**，
+ * 超限的那一刻就 cancel 掉流，而不是先把整个 body 收进内存再拒绝
+ * —— 后者对"上游返回 2GB"这种场景毫无防护作用。
+ */
+async function readBodyWithLimit(response: Response, limit: number): Promise<Uint8Array> {
+    const body = response.body;
+    // 没有流（少数运行时 / 已读过的 Response）只能退回整体读取。
+    if (!body) return new Uint8Array(await response.arrayBuffer());
+
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+
+            total += value.byteLength;
+            if (total > limit) {
+                throw new ProviderError("PROVIDER_UPSTREAM_ERROR", `上游响应体过大（已读取 ${Math.floor(total / 1024 / 1024)}MB > ${Math.floor(limit / 1024 / 1024)}MB）`, {
+                    retryable: false,
+                    status: response.status,
+                });
+            }
+            chunks.push(value);
+        }
+    } finally {
+        // 超限抛出时要把流 cancel 掉，否则上游还在推、连接不释放。
+        await reader.cancel().catch(() => undefined);
+    }
+
+    if (chunks.length === 0) return new Uint8Array(0);
+
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return merged;
 }
 
 /** 发请求并解析 JSON；非 2xx 抛错。 */
