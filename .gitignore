@@ -15,3 +15,8 @@ web/public/plugins
 plugins/canvas/*/dist
 plugins/canvas/*/node_modules
 web/public/plugins
+
+# 本项目新增：rclone 远端配置含密钥，绝不入库
+deploy/rclone/
+# 备份容器的本地暂存（若在宿主机映射过）
+deploy/data/

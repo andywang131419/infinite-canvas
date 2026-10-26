@@ -1,0 +1,27 @@
+{
+    "name": "@infinite-canvas/server",
+    "version": "0.20.0-fork.1",
+    "private": true,
+    "type": "module",
+    "description": "Infinite Canvas 自托管后端：画布持久化 / 资产存储 / 异步任务 / Provider 网关",
+    "license": "MIT",
+    "engines": {
+        "bun": ">=1.3.0"
+    },
+    "scripts": {
+        "dev": "bun --watch src/index.ts",
+        "start": "bun run src/index.ts",
+        "test": "bun test",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "hono": "^4.6.14",
+        "drizzle-orm": "^0.38.2",
+        "zod": "^3.24.1"
+    },
+    "devDependencies": {
+        "drizzle-kit": "^0.30.1",
+        "@types/bun": "^1.1.14",
+        "typescript": "^5.7.2"
+    }
+}

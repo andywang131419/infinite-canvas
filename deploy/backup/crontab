@@ -1,0 +1,7 @@
+# 默认计划任务（每日 03:00，容器时区由 TZ 决定）
+#
+# 注意：entrypoint.sh 启动时会用 BACKUP_CRON 环境变量**覆盖**本文件内容，
+# 所以这里只是镜像内的默认值 / 排障参考。改时间请改 deploy/.env 的 BACKUP_CRON。
+#
+# 分 时 日 月 周
+0 3 * * * /usr/local/bin/backup.sh >> /proc/1/fd/1 2>&1

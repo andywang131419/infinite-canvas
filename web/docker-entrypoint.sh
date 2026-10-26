@@ -11,11 +11,19 @@ sanitize_id() {
     printf '%s' "$1" | tr -cd 'A-Za-z0-9-'
 }
 
+# API_BASE_URL is a URL (e.g. https://api.example.com). Allow only URL-safe characters
+# so that quotes, backslashes and newlines can never escape the JS string literal below.
+sanitize_url() {
+    printf '%s' "$1" | tr -cd 'A-Za-z0-9:/._~-'
+}
+
 GA4_ID=$(sanitize_id "${ANALYTICS_GA4_ID:-}")
 BAIDU_ID=$(sanitize_id "${ANALYTICS_BAIDU_ID:-}")
+API_BASE=$(sanitize_url "${API_BASE_URL:-}")
 
 cat > /usr/share/nginx/html/config.js <<EOF
 window.__RUNTIME_CONFIG__ = {
+  API_BASE_URL: "${API_BASE}",
   ANALYTICS_GA4_ID: "${GA4_ID}",
   ANALYTICS_BAIDU_ID: "${BAIDU_ID}"
 };

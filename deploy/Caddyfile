@@ -1,0 +1,61 @@
+# =============================================================================
+# Caddy —— 唯一对外入口（ARCH Rev2 §R2.4 / §R3）
+#
+# 分流规则：
+#   /api/*   → server:8787   （Bun + Hono，同源，Cookie 天然同站，无 CORS）
+#   其余 /*  → web:3000      （上游 nginx 静态 SPA，nginx.conf 零改动）
+#
+# 环境变量（由 docker compose 注入）：
+#   APP_DOMAIN    站点域名。留空 → localhost（本机自签场景）
+#   TLS_MODE      internal（默认，自签）或你的邮箱（启用 Let's Encrypt）
+#                 ⚠️ 用真实域名时必须设为邮箱，否则浏览器会拒绝自签证书
+#   MAX_UPLOAD_MB 请求体上限，默认 200（与 server 的 MAX_UPLOAD_MB 保持一致）
+#
+# ⚠️ HSTS 说明：默认下发 max-age=1y。若你只在 localhost 用自签证书，
+#    建议临时注释掉 HSTS 行，否则浏览器会长期强制 https://localhost。
+# =============================================================================
+
+{
+	# 单机自托管不需要 Caddy 的 admin API（减少一个攻击面）
+	admin off
+}
+
+{$APP_DOMAIN:localhost} {
+	tls {$TLS_MODE:internal}
+
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# -------------------------------------------------------------------------
+	# 1) 后端 API —— 同源反代，无 CORS、无预检
+	# -------------------------------------------------------------------------
+	handle /api/* {
+		request_body {
+			max_size {$MAX_UPLOAD_MB:200}MB
+		}
+
+		reverse_proxy server:8787 {
+			# SSE / 流式响应绝不能被缓冲（画布助手流式问答必用，Tier2）
+			flush_interval -1
+
+			transport http {
+				dial_timeout 5s
+				# 视频任务最长 600s，留足余量；与 server 的 JOB_VIDEO_TIMEOUT_S 对齐
+				response_header_timeout 15m
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+
+	# -------------------------------------------------------------------------
+	# 2) 前端静态资源 —— nginx 内部仍负责 SPA fallback 与 /config.js no-store
+	#
+	# encode 只挂在静态侧，**故意不覆盖 /api/***：
+	#   text/event-stream 会命中 encode 的 text/* 规则，压缩层会引入缓冲，
+	#   导致 SSE 帧被攒批下发，前端看起来"卡住"。静态资源压缩收益大且无此风险。
+	# -------------------------------------------------------------------------
+	handle {
+		encode zstd gzip
+		reverse_proxy web:3000
+	}
+}

@@ -1,0 +1,174 @@
+# =============================================================================
+# 生产部署编排（ARCH Rev2 §R3 / T01 第 5 条）
+#
+#   4 个 service，只有 caddy 暴露 80/443；其余全在内部网络。
+#   web    = 上游 Dockerfile 产物（nginx + 构建好的 SPA），原样复用
+#   server = 本项目新增后端（Bun + Hono + bun:sqlite）
+#   backup = sqlite3 .backup + rclone + busybox crond
+#
+# 用法：
+#   cd deploy
+#   cp .env.example .env      # 然后务必改 AUTH_SECRET / APP_DOMAIN
+#   docker compose up -d --build
+#   curl -k https://localhost/api/health
+# =============================================================================
+
+name: infinite-canvas
+
+services:
+    # -------------------------------------------------------------------------
+    # Caddy：TLS + 唯一对外入口 + /api 分流
+    # -------------------------------------------------------------------------
+    caddy:
+        image: caddy:2-alpine
+        container_name: ic-caddy
+        restart: unless-stopped
+        ports:
+            - "80:80"
+            - "443:443"
+            - "443:443/udp" # HTTP/3
+        environment:
+            APP_DOMAIN: ${APP_DOMAIN:-localhost}
+            TLS_MODE: ${TLS_MODE:-internal}
+            MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+        volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+            - caddy_config:/config
+        depends_on:
+            server:
+                condition: service_healthy
+            web:
+                condition: service_started
+        networks:
+            - ic
+
+    # -------------------------------------------------------------------------
+    # web：上游 nginx 镜像，托管已构建的 SPA
+    # 构建上下文是仓库根（上游 Dockerfile 需要 web/ + VERSION + CHANGELOG.md）
+    # -------------------------------------------------------------------------
+    web:
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        container_name: ic-web
+        restart: unless-stopped
+        environment:
+            # 前端运行时配置，由 web/docker-entrypoint.sh 写进 /usr/share/nginx/html/config.js
+            API_BASE_URL: ${API_BASE_URL:-}
+            ANALYTICS_GA4_ID: ${ANALYTICS_GA4_ID:-}
+            ANALYTICS_BAIDU_ID: ${ANALYTICS_BAIDU_ID:-}
+        expose:
+            - "3000"
+        networks:
+            - ic
+
+    # -------------------------------------------------------------------------
+    # server：API + 内嵌 Worker + 本地资产存储
+    # -------------------------------------------------------------------------
+    server:
+        build:
+            context: ../server
+            dockerfile: Dockerfile
+        container_name: ic-server
+        restart: unless-stopped
+        stop_grace_period: 30s # 留出 Worker 优雅停机（等在途任务）的时间
+        environment:
+            NODE_ENV: production
+            APP_VERSION: ${APP_VERSION:-0.20.0-fork.1}
+            HTTP_PORT: "8787"
+            HTTP_HOST: 0.0.0.0
+            LOG_LEVEL: ${LOG_LEVEL:-info}
+
+            DATABASE_PATH: ${DATABASE_PATH:-/data/app.db}
+            DB_BUSY_TIMEOUT_MS: ${DB_BUSY_TIMEOUT_MS:-5000}
+
+            # 必填：未设置时 compose 直接拒绝启动，避免用弱密钥起来
+            AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET 未设置。请在 deploy/.env 中生成：openssl rand -base64 48}
+            SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-30}
+            ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+            LOGIN_RATE_LIMIT_PER_MIN: ${LOGIN_RATE_LIMIT_PER_MIN:-5}
+            COOKIE_SECURE: ${COOKIE_SECURE:-true}
+
+            STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+            STORAGE_LOCAL_ROOT: ${STORAGE_LOCAL_ROOT:-/data/media}
+            MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+            MAX_DOC_JSON_MB: ${MAX_DOC_JSON_MB:-8}
+
+            WORKER_ENABLED: ${WORKER_ENABLED:-true}
+            WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+            WORKER_POLL_MS: ${WORKER_POLL_MS:-1000}
+            WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-60}
+            JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-2}
+            JOB_IMAGE_TIMEOUT_S: ${JOB_IMAGE_TIMEOUT_S:-180}
+            JOB_VIDEO_TIMEOUT_S: ${JOB_VIDEO_TIMEOUT_S:-600}
+            JOB_RETRY_BACKOFF_S: ${JOB_RETRY_BACKOFF_S:-30}
+            MODEL_SCRIPT_ENABLED: ${MODEL_SCRIPT_ENABLED:-false}
+
+            LOCAL_AGENT_ENABLED: ${LOCAL_AGENT_ENABLED:-false}
+            UPSTREAM_HOST_ALLOWLIST: ${UPSTREAM_HOST_ALLOWLIST:-}
+
+            BACKUP_ENABLED: ${BACKUP_ENABLED:-true}
+            BACKUP_CRON: ${BACKUP_CRON:-0 3 * * *}
+            BACKUP_DB_KEEP_DAYS: ${BACKUP_DB_KEEP_DAYS:-14}
+            BACKUP_RETRY: ${BACKUP_RETRY:-3}
+            BACKUP_TARGET_LABEL: ${BACKUP_TARGET_LABEL:-}
+        volumes:
+            - data:/data
+        expose:
+            - "8787"
+        healthcheck:
+            # 用 bun 自身当探针，避免额外安装 curl
+            test:
+                [
+                    "CMD-SHELL",
+                    "bun -e \"fetch('http://127.0.0.1:8787/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+                ]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 20s
+        networks:
+            - ic
+
+    # -------------------------------------------------------------------------
+    # backup：每日 sqlite3 .backup → gzip → rclone → 远端，14 天滚动
+    # 与 server 共享 data 卷（只读 DB、写 /data/backups）
+    # -------------------------------------------------------------------------
+    backup:
+        build:
+            context: ./backup
+            dockerfile: Dockerfile
+        container_name: ic-backup
+        restart: unless-stopped
+        environment:
+            BACKUP_ENABLED: ${BACKUP_ENABLED:-true}
+            BACKUP_CRON: ${BACKUP_CRON:-0 3 * * *}
+            BACKUP_DB_KEEP_DAYS: ${BACKUP_DB_KEEP_DAYS:-14}
+            BACKUP_RETRY: ${BACKUP_RETRY:-3}
+            BACKUP_TARGET_LABEL: ${BACKUP_TARGET_LABEL:-}
+            DATABASE_PATH: ${DATABASE_PATH:-/data/app.db}
+            # 远端目标留空 = 只做本地备份（/data/backups），不上传
+            RCLONE_REMOTE: ${RCLONE_REMOTE:-}
+            RCLONE_DEST: ${RCLONE_DEST:-}
+            TZ: ${TZ:-Asia/Shanghai}
+        volumes:
+            - data:/data
+            # 把 rclone.conf 放进 deploy/rclone/ 目录即可被加载（缺失也不会报错）
+            - ./rclone:/config/rclone:ro
+        depends_on:
+            server:
+                condition: service_healthy
+        networks:
+            - ic
+
+volumes:
+    # 单卷策略：app.db + -wal + media + backups 全在 /data，便于整体打包迁移
+    data:
+    caddy_data:
+    caddy_config:
+
+networks:
+    # 普通 bridge：server 必须能出站访问 AI provider，**不能**设为 internal
+    ic:
+        driver: bridge

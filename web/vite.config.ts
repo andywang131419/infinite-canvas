@@ -50,4 +50,17 @@ export default defineConfig({
         __APP_VERSION__: JSON.stringify(localVersion),
         __APP_RELEASES__: JSON.stringify(parseChangelog(localChangelog)),
     },
+    server: {
+        host: "0.0.0.0",
+        port: 3000,
+        // 开发期把 /api 转发给本地后端（server/ 默认 8787），
+        // 使前端始终以「同域相对路径」调用 API —— 与生产 Caddy 分流行为一致，
+        // 因此开发期不再需要 canvas-proxy，也不需要 CORS 配置。
+        proxy: {
+            "/api": {
+                target: "http://127.0.0.1:8787",
+                changeOrigin: false,
+            },
+        },
+    },
 });
