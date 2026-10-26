@@ -1344,6 +1344,7 @@ check(`${tsFiles.length} 个 .ts 文件语法可解析`, () => {
 section("[9] 备份审计：失败必须可见（QA R2 P1-R2-5）");
 
 const backupSource = readFileSync(join(repoRoot, "..", "deploy/backup/backup.sh"), "utf8");
+const entrypointSource = readFileSync(join(repoRoot, "..", "deploy/backup/entrypoint.sh"), "utf8");
 const composeSource = readFileSync(join(repoRoot, "..", "deploy/docker-compose.yml"), "utf8");
 const envSource = readFileSync(join(repoRoot, "src/env.ts"), "utf8");
 const httpSource = readFileSync(join(repoRoot, "src/providers/http.ts"), "utf8");
@@ -1448,17 +1449,139 @@ check("布尔环境变量：无法判定的值仍然 fail-fast（不悄悄当 fa
     assertEqual(result.ok, false, "写 maybe 竟然通过了校验 —— 会被悄悄当成 false，等于静默关掉功能");
 });
 
-check("docker-compose：server 服务注入了 BACKUP_INCLUDE_MEDIA", () => {
-    const serverBlock = /\n    server:[\s\S]*?\n    \S/.exec(composeSource);
-    assert(serverBlock, "docker-compose 找不到 server 服务");
-    assert(/BACKUP_INCLUDE_MEDIA:/.test(serverBlock[0]), "server 服务仍缺少 BACKUP_INCLUDE_MEDIA（两边口径会对不上）");
+// ---------------------------------------------------------------------------
+// 「变量在代码里读了、在 .env.example 里声明了，却漏了注入 compose」的防回归
+//
+// 这个失败模式到目前为止已经出现**四次**：
+//   1. BACKUP_INCLUDE_MEDIA     未注入 server  → 媒体零备份（QA P1-3）
+//   2. RESULT_DOWNLOAD_ALLOWLIST 只写文档没注入 → 空白名单拒绝一切图片下载
+//   3. BACKUP_STAGE_DIR         只注入 backup  → 改了 .env 两边路径分裂
+//   4. RCLONE_CONFIG_FILE       未透传        → 想改配置路径的人只能去改脚本
+// 共同点：容器里恒为默认值/空值，且**没有任何报错**。靠人记不住，固化成断言。
+//
+// 只断言「漏了会静默失效」的关键键，不做 environment 全量比对 —— 全量断言会
+// 变成维护负担，最后大家为了省事把测试删掉。
+//
+// 这里不给 server 引入 yaml 依赖：只需要"某服务的 environment 块下有哪些键"，
+// 极简缩进扫描足够，且不跨目录依赖 web/node_modules。
+// ---------------------------------------------------------------------------
+
+/** 扫描 compose，返回 { 服务名: [environment 下的键] }。 */
+function collectComposeEnvKeys(source) {
+    const services = {};
+    let current = null;
+    let inEnv = false;
+
+    for (const rawLine of source.split("\n")) {
+        const line = rawLine.replace(/\r$/, "");
+
+        // 顶层段（services: / volumes: / networks:）：缩进 0，结束当前服务
+        if (/^\S/.test(line)) {
+            current = null;
+            inEnv = false;
+            continue;
+        }
+        // 服务名：4 空格缩进
+        const serviceMatch = /^ {4}([A-Za-z0-9_-]+):\s*$/.exec(line);
+        if (serviceMatch) {
+            current = serviceMatch[1];
+            inEnv = false;
+            continue;
+        }
+        if (current === null) continue;
+
+        if (/^ {8}environment:\s*$/.test(line)) {
+            inEnv = true;
+            continue;
+        }
+        if (inEnv) {
+            if (line.trim() === "") continue; // 块内空行
+            // environment 下的键是 12 空格缩进。**注释行也是 12 空格**，
+            // 所以只有缩进真的回落到 8 才算块结束 —— 否则第一个注释之后的
+            // 所有键都会被漏掉（这个 bug 我自己踩过一次）。
+            if (/^ {12}/.test(line)) {
+                const keyMatch = /^ {12}([A-Z0-9_]+):/.exec(line);
+                if (keyMatch) {
+                    if (!services[current]) services[current] = [];
+                    services[current].push(keyMatch[1]);
+                }
+                continue;
+            }
+            inEnv = false;
+        }
+    }
+
+    return services;
+}
+
+const composeEnvKeys = collectComposeEnvKeys(composeSource);
+
+/** 断言某服务注入了某个键；`consequence` 写清"漏了会怎样"。 */
+function assertComposeEnvKey(service, key, consequence) {
+    const keys = composeEnvKeys[service] ?? [];
+    assert(keys.includes(key), `compose 的 ${service} 服务缺少 ${key} —— ${consequence}`);
+}
+
+check("docker-compose：server 服务注入了 4 个漏了会静默失效的键", () => {
+    assertComposeEnvKey(
+        "server",
+        "BACKUP_INCLUDE_MEDIA",
+        "server 恒取默认值，与 backup 容器口径分裂：一边以为打包了媒体、另一边其实没打包（QA P1-3）",
+    );
+    assertComposeEnvKey(
+        "server",
+        "RESULT_DOWNLOAD_ALLOWLIST",
+        "容器里恒为空 = 拒绝一切结果下载 = 把 P1-R2-2 的 fail-closed 变成永久阻断，表现为「生成成功但画布无图」",
+    );
+    assertComposeEnvKey(
+        "server",
+        "BACKUP_STAGE_DIR",
+        "server 恒取默认 /data/backups，在 .env 改了路径后与 backup 容器分裂（备份在一个地方、清理在另一个地方）",
+    );
+    assertComposeEnvKey(
+        "server",
+        "STORAGE_LOCAL_ROOT",
+        "server 恒取默认 /data/media，改了路径后 backup 按新路径打媒体包、server 仍按旧路径存取，恢复后图照样 404",
+    );
 });
 
-check("docker-compose：server 服务注入了 RESULT_DOWNLOAD_ALLOWLIST", () => {
-    const serverBlock = /\n    server:[\s\S]*?\n    \S/.exec(composeSource);
-    assert(serverBlock, "docker-compose 找不到 server 服务");
-    // 不注入的话 server 容器里它恒为空 = 拒绝一切结果下载 = "生成成功但画布无图"。
-    assert(/RESULT_DOWNLOAD_ALLOWLIST:/.test(serverBlock[0]), "server 服务缺少 RESULT_DOWNLOAD_ALLOWLIST（结果下载会被永久 fail-closed 阻断）");
+check("docker-compose：backup 服务注入了 5 个漏了会静默失效的键", () => {
+    assertComposeEnvKey("backup", "BACKUP_ENABLED", "backup.sh 永远走默认值，运维在 .env 里关备份关不掉（或反过来）");
+    assertComposeEnvKey("backup", "BACKUP_ON_START", "该变量没被声明过 → 首份备份要拖到次日 03:00，新机器首日无备份");
+    assertComposeEnvKey("backup", "BACKUP_INCLUDE_MEDIA", "备份只覆盖 app.db，/data/media 下所有图片/视频零备份（QA P1-3）");
+    assertComposeEnvKey("backup", "BACKUP_STAGE_DIR", "与 server 的暂存目录不是同一个，审计行与实际落点不一致");
+    assertComposeEnvKey("backup", "RCLONE_CONFIG_FILE", "想改 rclone.conf 位置的人没法配，只能动手改 backup.sh");
+});
+
+check("docker-compose：RCLONE_REMOTE / RCLONE_DEST 键存在（留空是合法配置）", () => {
+    // 这两个是"可选功能开关"：留空 = 只做本地备份，是合法选择。
+    // 所以断言的是**键存在**而不是值非空 —— 把合法留空判成失败就矫枉过正了。
+    assertComposeEnvKey("backup", "RCLONE_REMOTE", "键都没写的话，运维在 .env 里配了远端也不生效");
+    assertComposeEnvKey("backup", "RCLONE_DEST", "键都没写的话，远端子目录无从指定");
+});
+
+check("docker-compose：只有 RCLONE_CONFIG_FILE，没有死配置 RCLONE_CONFIG（单数）", () => {
+    // backup.sh 已显式传 `--config`，rclone 的优先级是 flag > 环境变量，
+    // 单数的 RCLONE_CONFIG 传进去也没人读。这里只比对收集到的**键**，
+    // 不扫全文 —— 注释里为了说明这件事也提到了这个字符串，扫全文会误判。
+    for (const [service, keys] of Object.entries(composeEnvKeys)) {
+        assert(!keys.includes("RCLONE_CONFIG"), `${service} 服务注入了死配置 RCLONE_CONFIG（单数）：flag 优先，它不会被读取`);
+    }
+    assertComposeEnvKey("backup", "RCLONE_CONFIG_FILE", "缺少可用的配置路径变量");
+});
+
+check("entrypoint.sh 与 backup.sh 的 is_truthy 词表逐字一致", () => {
+    // 两边各自复制了一份（backup.sh 没有 main guard，source 它会当场触发一次备份）。
+    // 词表一旦漂移，就会出现"用户按文档写了 1/yes，结果备份被静默关掉"。
+    const extract = (source) => {
+        const matched = /is_truthy\(\)\s*\{([\s\S]*?)\n\}/.exec(source);
+        return matched ? matched[1].replace(/\s+/g, " ").trim() : null;
+    };
+    const entryBody = extract(entrypointSource);
+    const backupBody = extract(backupSource);
+    assert(entryBody, "entrypoint.sh 里找不到 is_truthy");
+    assert(backupBody, "backup.sh 里找不到 is_truthy");
+    assertEqual(entryBody, backupBody, "两处 is_truthy 函数体不一致 —— 布尔口径分裂会让备份被静默关掉");
 });
 
 check("sendRequest：先看 content-length 再读 body（512MB 上限真的能防住）", () => {
