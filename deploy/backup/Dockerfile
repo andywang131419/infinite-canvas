@@ -28,7 +28,10 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY crontab /etc/crontabs/root
 
 RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh \
-    && mkdir -p /data/backups /config/rclone \
+    # rclone 配置目录：alpine 官方 rclone 默认读 $HOME/.config/rclone，
+    # 本容器以 root 运行（HOME=/root），所以是 /root/.config/rclone。
+    # **不是** /config/rclone —— 那是 LinuxServer 系镜像的约定，这里不适用。
+    && mkdir -p /data/backups /root/.config/rclone \
     && sqlite3 --version \
     && rclone version | head -n 1
 

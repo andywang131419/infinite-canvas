@@ -32,6 +32,19 @@ INCLUDE_MEDIA="${BACKUP_INCLUDE_MEDIA:-true}"
 MEDIA_EXPECTED=0
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 RCLONE_DEST="${RCLONE_DEST:-}"
+# rclone 配置文件路径。
+#
+# 本镜像是 `alpine:3.20` + `apk add rclone`（**不是** LinuxServer 系镜像），
+# 它默认读 $HOME/.config/rclone/rclone.conf（root 下即 /root/.config/rclone/），
+# **不会**自动去读 /config/rclone —— 那是 LinuxServer 镜像的约定。
+# 之前 compose 把宿主 ./rclone 挂到了 /config/rclone，于是 RCLONE_REMOTE 配了
+# 也连不上远端，备份只剩 VPS 本地一份：机器一挂数据全没，而"数据自动持久"
+# 正是这次改造的全部意义。
+#
+# 现在挂载点改到 /root/.config/rclone（见 deploy/docker-compose.yml），
+# 这里再显式 `--config` 传一遍：busybox crond 派生的环境可能根本不设 HOME，
+# 只靠默认路径仍然是赌。两处指向同一个文件，互为兜底。
+RCLONE_CONFIG_FILE="${RCLONE_CONFIG_FILE:-/root/.config/rclone/rclone.conf}"
 TARGET_LABEL="${BACKUP_TARGET_LABEL:-}"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -240,9 +253,23 @@ if [ -n "$RCLONE_REMOTE" ]; then
         FINISHED=1
         exit 1
     fi
+    # 配置文件缺失必须显式报错。
+    #
+    # 以前 compose 的注释写"缺失也不会报错"，于是 rclone 拿着空配置静默连不上远端，
+    # 备份只剩 VPS 本地一份，而审计行照样 status=success —— 典型的备份静默失效。
+    # 原则同 P1-R2-5：既然 RCLONE_REMOTE 非空就是用户明确要异地备份，
+    # 传不上去等同于失败，必须记 failed 并 exit 1，不能照常报成功。
+    if [ ! -f "$RCLONE_CONFIG_FILE" ]; then
+        err "找不到 rclone 配置：$RCLONE_CONFIG_FILE（把 rclone.conf 放进 deploy/rclone/ 后重启，或用 RCLONE_CONFIG_FILE 指向别处）"
+        record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone config missing" "$MEDIA_EXPECTED"
+        FINISHED=1
+        exit 1
+    fi
+
     REMOTE_TARGET="$RCLONE_REMOTE:$RCLONE_DEST"
-    log "rclone → $REMOTE_TARGET"
+    log "rclone → $REMOTE_TARGET（配置：$RCLONE_CONFIG_FILE）"
     if rclone copy "$STAGE_DIR" "$REMOTE_TARGET" \
+        --config "$RCLONE_CONFIG_FILE" \
         --include 'app-*.sqlite.gz' --include 'media-*.tar.gz' \
         --retries "$RETRY" --low-level-retries "$RETRY" --stats-one-line; then
         log "上传完成"
