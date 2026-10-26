@@ -9,7 +9,9 @@ import { requestEdit, requestGeneration, requestImageQuestion } from "@/services
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { createVideoGenerationTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask } from "@/services/api/video";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { ensureImagePreview, uploadImage } from "@/services/image-storage";
+import { describeStoredImage, ensureImagePreview, uploadImage } from "@/services/image-storage";
+import { buildImageJobIdempotencyKey, firstImageStorageKey, isImageJobType, jobErrorMessage } from "@/services/api/job-utils";
+import { cancelJob, createJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -284,6 +286,14 @@ function InfiniteCanvasPage() {
     const pendingConnectionCreateRef = useRef(pendingConnectionCreate);
     const generationRequestsRef = useRef(new Map<string, CanvasGenerationRequest>());
     const videoPollIdsRef = useRef(new Set<string>());
+    /**
+     * 正在接续的 jobId → 它的 AbortController。
+     *
+     * 两个用途：
+     * 1. **去重**——同一个 job 不能被 attach 两次（挂载 effect 与提交路径可能同时碰上）；
+     * 2. **可停**——"停止生成"要能真正掐断恢复中的轮询，否则用户点了停止还在后台转。
+     */
+    const jobRecoveryRef = useRef(new Map<string, AbortController>());
 
     const createHistoryEntry = useCallback(
         (): CanvasHistoryEntry => ({
@@ -315,6 +325,160 @@ function InfiniteCanvasPage() {
         const request = generationRequestsRef.current.get(targetNodeId);
         if (request?.controller === controller) generationRequestsRef.current.delete(targetNodeId);
     }, []);
+
+    // -------------------------------------------------------------------------
+    // T04-B 阶段 1：图像生成改走服务端任务队列
+    //
+    // 之前生成是在浏览器里直连上游：页面一刷新，内存里的 controller / 轮询 id 全丢，
+    // 而 `resetInterruptedGeneration` 又把 loading 一律标成"已中断"，于是
+    // "服务端其实还在跑、前端已经宣布失败"。现在改成交给服务端队列，前端只负责
+    // 提交 + 轮询 + 写回。
+    // -------------------------------------------------------------------------
+
+    /**
+     * 参考图必须先变成 storageKey：服务端**禁止**把 `data:` 内联塞进 `jobs.params`
+     * （一个 tasks 表就能把 8MB 的画布再存一遍），`loadReferences` 只认 storageKey。
+     */
+    const resolveReferenceStorageKeys = useCallback(async (references: { storageKey?: string; dataUrl?: string }[], signal: AbortSignal) => {
+        const keys: string[] = [];
+        for (const reference of references) {
+            if (reference.storageKey) {
+                keys.push(reference.storageKey);
+                continue;
+            }
+            if (!reference.dataUrl) continue;
+            const uploaded = await uploadImage(reference.dataUrl, { signal });
+            if (uploaded.storageKey) keys.push(uploaded.storageKey);
+        }
+        return keys;
+    }, []);
+
+    /** 把一张成功的图写回节点（含等比缩放、居中、第一张作为主图）。 */
+    const applyImageItem = useCallback((rootId: string, imageId: string, item: CanvasNodeImage) => {
+        const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
+        const imageSize = fitNodeSize(item.naturalWidth, item.naturalHeight, imageConfig.width, imageConfig.height);
+        setNodes((prev) =>
+            prev.map((node) => {
+                if (node.id !== rootId) return node;
+                const images = node.metadata?.images?.map((image) => (image.id === imageId ? item : image)) || [];
+                if (node.metadata?.primaryImageId) return { ...node, metadata: { ...node.metadata, images } };
+                const center = { x: node.position.x + node.width / 2, y: node.position.y + node.height / 2 };
+                return {
+                    ...node,
+                    position: { x: center.x - imageSize.width / 2, y: center.y - imageSize.height / 2 },
+                    ...imageSize,
+                    metadata: {
+                        ...node.metadata,
+                        content: item.content,
+                        storageKey: item.storageKey,
+                        naturalWidth: item.naturalWidth,
+                        naturalHeight: item.naturalHeight,
+                        bytes: item.bytes,
+                        mimeType: item.mimeType,
+                        images,
+                        primaryImageId: imageId,
+                    },
+                };
+            }),
+        );
+    }, []);
+
+    /** 把一张失败的图标红（节点级不动，让"部分成功"仍然可见）。 */
+    const markImageError = useCallback((rootId: string, imageId: string, errorDetails: string) => {
+        setNodes((prev) =>
+            prev.map((node) =>
+                node.id === rootId
+                    ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } }
+                    : node,
+            ),
+        );
+    }, []);
+
+    /**
+     * 任务结果该写回哪张图：优先按 jobId 精确匹配，退化到第一个还在 loading 的空位。
+     *
+     * `nodes` 必须由调用方显式传入，**不能**在这里读 `nodesRef.current`：
+     * ref 是在 `useLayoutEffect` 里同步的（第 709 行），而恢复发生在 `restore()` 里
+     * `setNodes` 之后、重渲染之前 —— 那时 ref 还是上一个画布的内容，
+     * 按它找图会把结果写进根本不存在的 imageId，或者退化成空串。
+     */
+    const pickImageIdForJob = useCallback((job: JobDto, nodes: CanvasNodeData[]) => {
+        const images = nodes.find((node) => node.id === job.nodeId)?.metadata?.images || [];
+        const matched = images.find((image) => image.jobId === job.id);
+        if (matched) return matched.id;
+        const pending = images.find((image) => image.status === NODE_STATUS_LOADING && !image.jobId);
+        return pending?.id ?? images[0]?.id ?? "";
+    }, []);
+
+    /**
+     * 把服务端还在跑的图像任务**接回**画布。
+     *
+     * 只做两件事：轮询 + 写回。绝不重新提交 —— 重新提交就是重复调上游、重复扣费。
+     */
+    const attachOpenImageJobs = useCallback(
+        (jobs: JobDto[], nodes: CanvasNodeData[]) => {
+            for (const job of jobs) {
+                if (jobRecoveryRef.current.has(job.id)) continue;
+                const controller = new AbortController();
+                jobRecoveryRef.current.set(job.id, controller);
+                void (async () => {
+                    const imageId = pickImageIdForJob(job, nodes);
+                    const reportFailure = (errorDetails: string) => {
+                        if (!imageId) {
+                            setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
+                            return;
+                        }
+                        markImageError(job.nodeId, imageId, errorDetails);
+                    };
+                    try {
+                        const finished = await waitForJob(job.id, { signal: controller.signal });
+                        if (finished.status !== "succeeded") {
+                            reportFailure(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+                            return;
+                        }
+                        const storageKey = firstImageStorageKey(finished.resultStorageKeys);
+                        if (!storageKey) {
+                            reportFailure(t("canvas.projectPage.generationFailed"));
+                            return;
+                        }
+                        const described = await describeStoredImage(storageKey, { signal: controller.signal });
+                        applyImageItem(job.nodeId, imageId, {
+                            id: imageId,
+                            jobId: job.id,
+                            status: NODE_STATUS_SUCCESS,
+                            content: described.url,
+                            storageKey,
+                            naturalWidth: described.width,
+                            naturalHeight: described.height,
+                            bytes: described.bytes,
+                            mimeType: described.mimeType,
+                        });
+                    } catch (error) {
+                        // 取消不是失败，不该弹红字；其余错误要让节点脱离 loading。
+                        if (!isGenerationCanceled(error)) reportFailure(error instanceof Error ? error.message : t("canvas.projectPage.generationFailed"));
+                    } finally {
+                        jobRecoveryRef.current.delete(job.id);
+                    }
+                })();
+            }
+        },
+        [applyImageItem, markImageError, pickImageIdForJob, t],
+    );
+
+    /**
+     * 打开画布时先问服务端"这个画布还有哪些活没干完"。
+     *
+     * 查不到（报错 / 未登录 / 服务端没开）时返回空集合，恢复退化成改动前的
+     * "一律标中断" —— 查询失败不能把整个画布打不开。
+     */
+    const fetchOpenImageJobs = useCallback(async () => {
+        try {
+            const jobs = (await listOpenJobs(projectId)).filter((job) => isImageJobType(job.type));
+            return { jobs, nodeIds: new Set(jobs.map((job) => job.nodeId)) };
+        } catch {
+            return { jobs: [] as JobDto[], nodeIds: new Set<string>() };
+        }
+    }, [projectId]);
 
     const completeVideoNodeTask = useCallback(
         async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, images: Parameters<typeof createVideoGenerationTask>[2], signal: AbortSignal, extra: CanvasNodeData["metadata"] = {}, videos: ReferenceVideo[] = [], audios: ReferenceAudio[] = []) => {
@@ -405,6 +569,23 @@ function InfiniteCanvasPage() {
         });
         setRunningNodeId((current) => (current === runningId ? null : current));
         if (!affectedNodeIds.size) return;
+        // T04-B：生成已经搬到服务端跑了，"停止"就**必须**让服务端也停。
+        // 只 abort 前端 controller 的话，job 会在服务端继续跑完并照常计费，
+        // 而用户这边已经看到"已取消"——钱花了、图没了。
+        const jobIds = new Set<string>();
+        nodesRef.current.forEach((node) => {
+            if (!affectedNodeIds.has(node.id)) return;
+            node.metadata?.images?.forEach((image) => {
+                if (image.jobId) jobIds.add(image.jobId);
+            });
+            if (node.metadata?.jobId) jobIds.add(node.metadata.jobId);
+        });
+        jobIds.forEach((jobId) => {
+            jobRecoveryRef.current.get(jobId)?.abort();
+            jobRecoveryRef.current.delete(jobId);
+            // 已是终态时服务端会返回 VALIDATION_FAILED，这里不关心：取消本就是尽力而为。
+            void cancelJob(jobId).catch(() => undefined);
+        });
         setNodes((prev) =>
             prev.map((node) =>
                 affectedNodeIds.has(node.id) && node.metadata?.status === NODE_STATUS_LOADING
@@ -447,9 +628,17 @@ function InfiniteCanvasPage() {
         }
 
         const restore = async () => {
-            const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes));
+            // 顺序是**有意**的：先问服务端"这个画布还有哪些活没干完"，再决定谁该被标"已中断"。
+            // 反过来（先 reset）会把服务端还在跑的图打成"已中断"，接着又 attach 上同一个 job，
+            // 用户会看到"红一下又转起来"，而节点上的错误文案要等任务结束才被覆盖。
+            const { jobs: openJobs, nodeIds: busyNodeIds } = await fetchOpenImageJobs();
+            const restoredNodes = await hydrateCanvasImages(resetInterruptedGeneration(project.nodes, busyNodeIds));
             const restoredSessions = await hydrateAssistantImages(project.chatSessions || []);
             setNodes(restoredNodes);
+            // 必须在 setNodes 之后、且把 restoredNodes 显式传进去：
+            // 写回按节点 id / imageId 定位，而 nodesRef 要等 useLayoutEffect 才更新（709 行），
+            // 此刻读它拿到的还是上一个画布。
+            attachOpenImageJobs(openJobs, restoredNodes);
             setConnections(project.connections);
             setChatSessions(restoredSessions);
             setActiveChatId(project.activeChatId || null);
@@ -473,7 +662,7 @@ function InfiniteCanvasPage() {
             setProjectLoaded(true);
         };
         void restore();
-    }, [hydrated, navigate, openProject, projectId]);
+    }, [attachOpenImageJobs, fetchOpenImageJobs, hydrated, navigate, openProject, projectId]);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -2470,39 +2659,53 @@ function InfiniteCanvasPage() {
                     let hasSuccess = false;
                     let hasFailure = false;
                     let firstError = "";
+                    // 参考图必须先落库成 storageKey：服务端禁止把 `data:` 内联塞进 params。
+                    // 这一步在 Promise.all 外面做一次，N 张图共用同一批参考图，不必重复上传。
+                    const referenceStorageKeys = await resolveReferenceStorageKeys(referenceImages, controller.signal);
                     await Promise.all(
                         imageIds.map(async (imageId) => {
                             try {
-                                const image = referenceImages.length
-                                    ? await requestEdit({ ...generationConfig, count: "1" }, effectivePrompt, referenceImages, { signal: controller.signal }).then((items) => items[0])
-                                    : await requestGeneration({ ...generationConfig, count: "1" }, effectivePrompt, { signal: controller.signal }).then((items) => items[0]);
-                                const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
-                                const imageSize = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
-                                const item: CanvasNodeImage = { id: imageId, status: NODE_STATUS_SUCCESS, content: uploaded.url, storageKey: uploaded.storageKey, naturalWidth: uploaded.width, naturalHeight: uploaded.height, bytes: uploaded.bytes, mimeType: uploaded.mimeType };
-                                setNodes((prev) =>
-                                    prev.map((node) => {
-                                        if (node.id !== rootId) return node;
-                                        const images = node.metadata?.images?.map((image) => (image.id === imageId ? item : image)) || [];
-                                        if (node.metadata?.primaryImageId) return { ...node, metadata: { ...node.metadata, images } };
-                                        const center = { x: node.position.x + node.width / 2, y: node.position.y + node.height / 2 };
-                                        return {
-                                            ...node,
-                                            position: { x: center.x - imageSize.width / 2, y: center.y - imageSize.height / 2 },
-                                            ...imageSize,
-                                            metadata: {
-                                                ...node.metadata,
-                                                content: item.content,
-                                                storageKey: item.storageKey,
-                                                naturalWidth: item.naturalWidth,
-                                                naturalHeight: item.naturalHeight,
-                                                bytes: item.bytes,
-                                                mimeType: item.mimeType,
-                                                images,
-                                                primaryImageId: imageId,
-                                            },
-                                        };
-                                    }),
+                                // 幂等键必须稳定（见 job-utils）：恢复路径查不到 job 时会退化成重新提交，
+                                // 只有稳定的键才能让服务端按 (user_id, idempotency_key) 去重，不重复扣费。
+                                const { job } = await createJob(
+                                    {
+                                        canvasId: projectId,
+                                        nodeId: rootId,
+                                        type: referenceStorageKeys.length ? "image_edit" : "image",
+                                        model: generationConfig.model,
+                                        params: {
+                                            prompt: effectivePrompt,
+                                            references: referenceStorageKeys,
+                                            count: 1,
+                                            size: generationConfig.size,
+                                            quality: generationConfig.quality,
+                                            background: generationConfig.background,
+                                        },
+                                        idempotencyKey: buildImageJobIdempotencyKey(rootId, imageId),
+                                    },
+                                    controller.signal,
                                 );
+                                // jobId 先落到这张图上：刷新后恢复逻辑靠它把结果对回同一张图，
+                                // 否则 N 张图同时跑完时只能靠"第一个 loading 空位"猜。
+                                setNodes((prev) =>
+                                    prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => (image.id === imageId ? { ...image, jobId: job.id } : image)) } } : node)),
+                                );
+                                const finished = await waitForJob(job.id, { signal: controller.signal });
+                                if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+                                const storageKey = firstImageStorageKey(finished.resultStorageKeys);
+                                if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+                                const described = await describeStoredImage(storageKey, { signal: controller.signal });
+                                applyImageItem(rootId, imageId, {
+                                    id: imageId,
+                                    jobId: job.id,
+                                    status: NODE_STATUS_SUCCESS,
+                                    content: described.url,
+                                    storageKey,
+                                    naturalWidth: described.width,
+                                    naturalHeight: described.height,
+                                    bytes: described.bytes,
+                                    mimeType: described.mimeType,
+                                });
                                 hasSuccess = true;
                                 if (isConfigNode) setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)));
                                 return true;
@@ -2511,7 +2714,7 @@ function InfiniteCanvasPage() {
                                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
                                 if (!firstError) firstError = errorDetails;
                                 hasFailure = true;
-                                setNodes((prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)) } } : node)));
+                                markImageError(rootId, imageId, errorDetails);
                             }
                             return false;
                         }),
@@ -2759,7 +2962,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [completeVideoNodeTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [applyImageItem, completeVideoNodeTask, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;

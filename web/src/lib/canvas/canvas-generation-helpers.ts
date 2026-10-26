@@ -127,10 +127,18 @@ export function hasResumableVideoTask(node: CanvasNodeData) {
     return node.type === CanvasNodeType.Video && Boolean(node.metadata?.videoTaskId) && !node.metadata?.content;
 }
 
-export function resetInterruptedGeneration(nodes: CanvasNodeData[]) {
+/**
+ * 把上次进程里没跑完的 `loading` 节点标成"已中断"。
+ *
+ * @param skipNodeIds 这些节点**不动**（T04-B）。刷新后如果服务端还有它们的
+ *   未完成任务，标成 error 就等于告诉用户"失败了"，而任务其实还在跑、结果回来
+ *   也无处写回。调用方负责先查 `GET /api/jobs?open=true` 再传进来。
+ *   查不到任务时传空集合，行为与改动前完全一致。
+ */
+export function resetInterruptedGeneration(nodes: CanvasNodeData[], skipNodeIds: ReadonlySet<string> = new Set()) {
     return nodes.map((node) =>
         node.metadata?.status === "loading"
-            ? hasResumableVideoTask(node)
+            ? hasResumableVideoTask(node) || skipNodeIds.has(node.id)
                 ? node
                 : {
                       ...node,
@@ -146,8 +154,19 @@ export function resetInterruptedGeneration(nodes: CanvasNodeData[]) {
     );
 }
 
+/**
+ * 是否"用户主动取消"，而不是真的失败。
+ *
+ * 取消一共有三种形状，缺一种就会把"用户点了停止"当成生成失败弹红字：
+ * 1. `AbortError`（`fetch` 被 abort、`waitForJob` 被取消）；
+ * 2. `ServerApiError{ code: "ABORTED" }` —— `server-api.ts` 在发现
+ *    `signal.aborted` 时抛这个（T04-B 起轮询走服务端 API，这条路径变常见）；
+ * 3. 上游文案 `common.requestCanceled`。
+ */
 export function isGenerationCanceled(error: unknown) {
-    return error instanceof Error && (error.message === i18n.t("common.requestCanceled") || error.name === "AbortError");
+    if (!(error instanceof Error)) return false;
+    if (error.message === i18n.t("common.requestCanceled") || error.name === "AbortError") return true;
+    return (error as { code?: unknown }).code === "ABORTED";
 }
 
 export function findRetrySourceNode(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {

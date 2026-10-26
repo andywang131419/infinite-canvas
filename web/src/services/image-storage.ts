@@ -191,6 +191,31 @@ export async function getImageBlob(storageKey: string) {
     return store.getItem<Blob>(storageKey);
 }
 
+/**
+ * 由 **已有** storageKey 反查出一份可写回节点的图片描述（T04-B）。
+ *
+ * 生成走服务端任务后，产物不再经过浏览器：Worker 直接落盘成 `image:xxx`，
+ * 前端只拿到 key。但节点里要写 `content / naturalWidth / naturalHeight / bytes /
+ * mimeType`，所以需要一个"由 key 反查元信息"的入口。
+ *
+ * 与 `uploadImage` 的区别：那个是"我有字节，要存"；这个是"服务端已经存好了，
+ * 我要读它的地址与尺寸"。不重复存储。
+ */
+export async function describeStoredImage(storageKey: string, options?: ImageReadOptions): Promise<UploadedImage> {
+    const url = await resolveImageUrl(storageKey);
+    throwIfAborted(options?.signal);
+    const meta = await loadImageMeta(url, options);
+    const blob = await fetchStoredImageBlob(storageKey);
+    return {
+        url,
+        storageKey,
+        width: meta?.width ?? 0,
+        height: meta?.height ?? 0,
+        bytes: blob?.size ?? 0,
+        mimeType: blob?.type && blob.type.startsWith("image/") ? blob.type : "",
+    };
+}
+
 // 缩略图按图片的 storageKey 另存一份 WebP，只放在本地 IndexedDB 里，不写进节点数据，也不参与导出和 WebDAV 同步。
 export function previewUrlFor(storageKey?: string) {
     return storageKey ? previewUrls.get(storageKey) : undefined;

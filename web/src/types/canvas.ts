@@ -35,6 +35,12 @@ export type CanvasNodeImage = {
     naturalHeight: number;
     bytes: number;
     mimeType: string;
+    /**
+     * 服务端任务 id（T04-B）。粒度是**每张图一个 job**：一次"生成 4 张"有 4 个
+     * imageId，其中 2 张失败时要能单独重试，所以 jobId 挂在**图**上而不是节点上。
+     * 刷新后靠它把结果写回正确的那张图。
+     */
+    jobId?: string;
 };
 
 export type CanvasNodeText = {
@@ -83,6 +89,14 @@ export type CanvasNodeMetadata = {
     durationMs?: number;
     videoTaskId?: string;
     videoTaskProvider?: "openai" | "gemini";
+    /**
+     * 服务端任务 id（T04-B）。
+     *
+     * 节点级只是**归组键**：一次生成 N 张图时，真正的 jobId 记在每张图的
+     * `images[].jobId` 上（见 `CanvasNodeImage.jobId`）；这里存的是本节点最近
+     * 一次提交的任务，用于快速判断"这个节点有没有在跑的活"。
+     */
+    jobId?: string;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };
