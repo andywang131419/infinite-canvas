@@ -224,6 +224,86 @@ export function resolveImageWriteTarget(job: { id?: string } | null | undefined,
     return { kind: "skip" };
 }
 
+/** 参与配对的任务最小形状（比 `JobDto` 宽，方便单测里手搓）。 */
+type PairableJob = { id?: string; createdAt?: string | null };
+
+/** 槽位可接管程度：数字越小越优先。`null` 表示这个槽位不能碰。 */
+function slotPriority(status: string | null | undefined): number | null {
+    if (status === "loading") return 0;
+    if (status === "error") return 1;
+    if (status === "idle") return 2;
+    if (status === undefined || status === null) return 3;
+    // `success` 和任何未知状态都**不能**被接管 —— 覆盖成功结果是不可逆的数据丢失。
+    return null;
+}
+
+/**
+ * **一次性**把 N 个任务配到 N 个空槽位上（P1-1）。
+ *
+ * 为什么不能对 N 个 job 逐个调 `resolveImageWriteTarget`：批量生成 4 张时，如果
+ * 刷新发生在"jobId 写回槽位"之前（画布持久化是防抖的，这个窗口真实存在），
+ * 4 个 job 看到的都是同一批"无 jobId 的 loading 槽位"，于是**全部选中第一个** ——
+ * 后写的覆盖先写的：3 张结果丢失，而上游照扣 4 次费。
+ *
+ * 逐个调用时，第一个 job 占了槽位 1 之后，槽位 1 上新增的 jobId 未必已经落盘，
+ * 第二个 job 调同一个函数时看到的还是老样子。所以配对必须在**一次调用内**完成，
+ * 结果不依赖"上一次的 jobId 是否已持久化"。
+ *
+ * 配对顺序：先按 jobId 精确匹配；剩下的任务按 `createdAt` 升序（提交顺序）依次
+ * 领走剩余的安全槽位。槽位优先级 loading → error → idle/空，`success` 永不参与。
+ * 任务比安全槽位多时，多出来的拿 `skip`。
+ *
+ * @returns 与 `jobs` 等长、下标一一对应的落点数组
+ */
+export function pairImageWriteTargets(jobs: readonly PairableJob[] | null | undefined, node: WriteTargetNode): ImageWriteTarget[] {
+    const list = jobs ?? [];
+    if (!node) return list.map(() => null);
+    const images = node.metadata?.images || [];
+    // 单图节点：结果落在 `metadata.content`，不走 images[]。
+    if (!images.length) return list.map(() => ({ kind: "node" }) as ImageWriteTarget);
+
+    const targets: ImageWriteTarget[] = list.map(() => null);
+    const claimedSlots = new Set<number>();
+
+    // 1) 精确匹配优先：这张图本来就是为这个任务建的。
+    list.forEach((job, index) => {
+        if (!job?.id) return;
+        const slot = images.findIndex((image, slotIndex) => !claimedSlots.has(slotIndex) && image.jobId === job.id);
+        if (slot < 0 || !images[slot].id) return;
+        claimedSlots.add(slot);
+        targets[index] = { kind: "image", imageId: images[slot].id as string };
+    });
+
+    // 2) 剩下的任务按提交顺序领走剩余的安全槽位。
+    const safeSlots = images
+        .map((image, slotIndex) => ({ slotIndex, priority: slotPriority(image.status), id: image.id }))
+        .filter((slot) => slot.priority !== null && Boolean(slot.id))
+        .sort((a, b) => (a.priority as number) - (b.priority as number) || a.slotIndex - b.slotIndex)
+        .map((slot) => slot.slotIndex);
+
+    const unpaired = list
+        .map((job, index) => ({ index, createdAt: job?.createdAt ?? "" }))
+        .filter((item) => targets[item.index] === null)
+        // createdAt 相同时按下标兜底，保证配对顺序稳定可复现。
+        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) || a.index - b.index);
+
+    let cursor = 0;
+    for (const { index } of unpaired) {
+        while (cursor < safeSlots.length && claimedSlots.has(safeSlots[cursor])) cursor += 1;
+        const slot = cursor < safeSlots.length ? safeSlots[cursor] : undefined;
+        if (slot === undefined) {
+            // 任务比安全槽位多：没有落点就什么都不写，绝不挤掉任何一张。
+            targets[index] = { kind: "skip" };
+            continue;
+        }
+        cursor += 1;
+        claimedSlots.add(slot);
+        targets[index] = { kind: "image", imageId: images[slot].id as string };
+    }
+
+    return targets;
+}
+
 /**
  * job 失败时给用户的文案。
  *

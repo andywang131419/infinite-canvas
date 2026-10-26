@@ -13,6 +13,7 @@ import {
     isVideoJobType,
     jobErrorMessage,
     mapJobStatusToNodeStatus,
+    pairImageWriteTargets,
     resolveImageWriteTarget,
     videoAspectRatioForJob,
 } from "../src/services/api/job-utils";
@@ -191,6 +192,103 @@ describe("结果写回落点（阶段 3）", () => {
     it("节点都不存在了就返回 null，交给调用方放弃写回", () => {
         expect(resolveImageWriteTarget({ id: "job_1" }, undefined)).toBe(null);
         expect(resolveImageWriteTarget({ id: "job_1" }, null)).toBe(null);
+    });
+});
+
+describe("批量配对（P1-1：多个 job 不许撞同一个槽位）", () => {
+    // 逐个调 `resolveImageWriteTarget` 是修不干净的：第一个 job 占了槽位 1 之后，
+    // 槽位 1 上新增的 jobId 未必已经落盘（画布持久化是防抖的），第二个 job 看到的
+    // 还是同一批"无 jobId 的 loading 槽位"，于是又选槽位 1。
+    // 实测后果：一次生成 4 张 → 4 个 job 全部写进第 1 张 → 3 张丢失，上游照扣 4 次费。
+    it("4 个 job 对 4 个空 loading 槽位：必须一一配对，不能撞车", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "loading" },
+                    { id: "img_2", status: "loading" },
+                    { id: "img_3", status: "loading" },
+                    { id: "img_4", status: "loading" },
+                ],
+            },
+        };
+        const jobs = [
+            { id: "job_1", createdAt: "2026-01-01T00:00:00.000Z" },
+            { id: "job_2", createdAt: "2026-01-01T00:00:01.000Z" },
+            { id: "job_3", createdAt: "2026-01-01T00:00:02.000Z" },
+            { id: "job_4", createdAt: "2026-01-01T00:00:03.000Z" },
+        ];
+        const targets = pairImageWriteTargets(jobs, node);
+        const picked = targets.map((target) => (target?.kind === "image" ? target.imageId : null));
+        expect(picked).toEqual(["img_1", "img_2", "img_3", "img_4"]);
+        // 关键是"互不相同"：撞车就是覆盖，覆盖就是丢图。
+        expect(new Set(picked).size).toBe(4);
+    });
+
+    it("提交顺序被打乱也按 createdAt 稳定配对（服务端列表是倒序返回的）", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "loading" },
+                    { id: "img_2", status: "loading" },
+                ],
+            },
+        };
+        // 服务端 `open` 列表现在是 created_at DESC，所以先拿到的是新的那个。
+        const jobs = [
+            { id: "job_2", createdAt: "2026-01-01T00:00:09.000Z" },
+            { id: "job_1", createdAt: "2026-01-01T00:00:01.000Z" },
+        ];
+        const targets = pairImageWriteTargets(jobs, node);
+        // 下标跟着入参走：targets[0] 是数组里的第一个（job_2，较新）→ img_2；
+        // targets[1] 是 job_1（较早）→ img_1。配对依据的是 createdAt，不是数组顺序。
+        expect(targets[0]).toEqual({ kind: "image", imageId: "img_2" });
+        expect(targets[1]).toEqual({ kind: "image", imageId: "img_1" });
+    });
+
+    it("精确匹配优先：认得 jobId 的槽位先被领走，剩下的再按顺序配", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "loading" },
+                    { id: "img_2", status: "loading", jobId: "job_9" },
+                    { id: "img_3", status: "loading" },
+                ],
+            },
+        };
+        const jobs = [
+            { id: "job_1", createdAt: "2026-01-01T00:00:01.000Z" },
+            { id: "job_9", createdAt: "2026-01-01T00:00:02.000Z" },
+            { id: "job_2", createdAt: "2026-01-01T00:00:03.000Z" },
+        ];
+        const targets = pairImageWriteTargets(jobs, node);
+        expect(targets[1]).toEqual({ kind: "image", imageId: "img_2" }); // 精确命中
+        expect(targets[0]).toEqual({ kind: "image", imageId: "img_1" });
+        expect(targets[2]).toEqual({ kind: "image", imageId: "img_3" });
+        const picked = targets.map((target) => (target?.kind === "image" ? target.imageId : null));
+        expect(new Set(picked).size).toBe(3);
+    });
+
+    it("job 比安全槽位多：多出来的拿 skip，绝不挤掉任何一张", () => {
+        const node = {
+            metadata: {
+                images: [
+                    { id: "img_1", status: "loading" },
+                    { id: "img_2", status: "success" },
+                ],
+            },
+        };
+        const jobs = [
+            { id: "job_1", createdAt: "2026-01-01T00:00:01.000Z" },
+            { id: "job_2", createdAt: "2026-01-01T00:00:02.000Z" },
+        ];
+        const targets = pairImageWriteTargets(jobs, node);
+        expect(targets[0]).toEqual({ kind: "image", imageId: "img_1" });
+        expect(targets[1]).toEqual({ kind: "skip" }); // 不能去碰 img_2（已成功）
+    });
+
+    it("单图节点：每个 job 都写节点本身", () => {
+        const targets = pairImageWriteTargets([{ id: "job_1", createdAt: "x" }, { id: "job_2", createdAt: "y" }], { metadata: {} });
+        expect(targets).toEqual([{ kind: "node" }, { kind: "node" }]);
     });
 });
 

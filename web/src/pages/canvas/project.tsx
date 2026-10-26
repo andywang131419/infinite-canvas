@@ -23,7 +23,8 @@ import {
     isTerminalJobStatus,
     isVideoJobType,
     jobErrorMessage,
-    resolveImageWriteTarget,
+    pairImageWriteTargets,
+    type ImageWriteTarget,
     videoAspectRatioForJob,
 } from "@/services/api/job-utils";
 import { cancelJob, createJob, getJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
@@ -346,6 +347,27 @@ function InfiniteCanvasPage() {
         if (request?.controller === controller) generationRequestsRef.current.delete(targetNodeId);
     }, []);
 
+    /**
+     * 收起某个节点的"停止"按钮 —— **前提是这个节点真的没有在途请求了**（P1-2）。
+     *
+     * 无条件 `setRunningNodeId(null)` 会出事故：用户刷新后又在同一个节点发起新生成，
+     * 旧任务（恢复接续的那个）轮询结束时把计数归零，顺手把**新生成**的
+     * `runningNodeId` 也清掉了。表现是停止按钮消失、用户点不了停止、服务端继续跑。
+     * 这正是 P1-b 修的那个现象，只是触发路径换成了"新旧两批任务叠在同一个节点上"。
+     *
+     * 所以清之前先看 `generationRequestsRef` 里有没有别的请求还挂在这个 runningId 上
+     * —— 有就说明还有活没干完，按钮必须留着。调用方要先 `finishGenerationRequest`
+     * 把自己摘掉，再调这里。
+     */
+    const clearRunningNodeIdIfIdle = useCallback((runningId: string) => {
+        let stillRunning = false;
+        generationRequestsRef.current.forEach((request) => {
+            if (request.runningNodeId === runningId) stillRunning = true;
+        });
+        if (stillRunning) return;
+        setRunningNodeId((current) => (current === runningId ? null : current));
+    }, []);
+
     // -------------------------------------------------------------------------
     // T04-B 阶段 1：图像生成改走服务端任务队列
     //
@@ -431,6 +453,21 @@ function InfiniteCanvasPage() {
      */
     const attachOpenJobs = useCallback(
         (jobs: JobDto[], nodes: CanvasNodeData[]) => {
+            // 落点**必须一次性配对**（P1-1）。逐个调 `resolveImageWriteTarget` 的话，
+            // "一次生成 4 张"的 4 个 job 会同时选中第一个 loading 槽位 —— 槽位上新增的
+            // jobId 还没落盘（画布持久化是防抖的），后一个 job 看到的还是老样子。
+            // 结果：后写的覆盖先写的，3 张丢失，上游照扣 4 次费。
+            const targetsByJobId = new Map<string, ImageWriteTarget>();
+            const jobsByNodeId = new Map<string, JobDto[]>();
+            for (const job of jobs) {
+                const bucket = jobsByNodeId.get(job.nodeId);
+                if (bucket) bucket.push(job);
+                else jobsByNodeId.set(job.nodeId, [job]);
+            }
+            for (const [nodeId, nodeJobs] of jobsByNodeId) {
+                const targets = pairImageWriteTargets(nodeJobs, nodes.find((item) => item.id === nodeId));
+                nodeJobs.forEach((job, index) => targetsByJobId.set(job.id, targets[index]));
+            }
             for (const job of jobs) {
                 if (jobRecoveryRef.current.has(job.id)) continue;
                 const controller = new AbortController();
@@ -457,7 +494,7 @@ function InfiniteCanvasPage() {
                             setNodes((prev) => prev.map((node) => (node.id === job.nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails } } : node)));
                             return;
                         }
-                        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+                        const target = targetsByJobId.get(job.id) ?? null;
                         // 每张图都已经是 success 时没有安全落点：任务失败了，但画布上
                         // 的好图一张都不能动 —— 连标红都不标（标红会让用户以为好图坏了）。
                         if (target?.kind === "image") markImageError(job.nodeId, target.imageId, errorDetails);
@@ -484,7 +521,7 @@ function InfiniteCanvasPage() {
 
                         const storageKey = firstImageStorageKey(finished.resultStorageKeys);
                         if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
-                        const target = resolveImageWriteTarget(job, nodes.find((node) => node.id === job.nodeId));
+                        const target = targetsByJobId.get(job.id) ?? null;
                         // 没有安全落点（每张图都已经是 success）：这次结果只能丢掉。
                         // 覆盖一张已经生成好的图是不可逆的数据丢失，而少写一张可以重试。
                         if (target?.kind === "skip") return;
@@ -529,14 +566,16 @@ function InfiniteCanvasPage() {
                         if (remaining > 0) recoveryNodeCountsRef.current.set(job.nodeId, remaining);
                         else {
                             recoveryNodeCountsRef.current.delete(job.nodeId);
-                            // 这个节点上接续的任务全部结束了才收起停止按钮。
-                            setRunningNodeId((current) => (current === job.nodeId ? null : current));
+                            // 这个节点上接续的任务全部结束了才**考虑**收起停止按钮 ——
+                            // `clearRunningNodeIdIfIdle` 会再确认一次没有别的在途请求
+                            // （用户可能在这期间又发起了一次新生成）。
+                            clearRunningNodeIdIfIdle(job.nodeId);
                         }
                     }
                 })();
             }
         },
-        [applyImageItem, finishGenerationRequest, markImageError, startGenerationRequest, t],
+        [applyImageItem, clearRunningNodeIdIfIdle, finishGenerationRequest, markImageError, startGenerationRequest, t],
     );
 
     /**
@@ -3132,10 +3171,12 @@ function InfiniteCanvasPage() {
                 );
             } finally {
                 finishGenerationRequest(nodeId, runController);
-                setRunningNodeId(null);
+                // 同 `attachOpenJobs`：这个节点上可能还有别在途的请求（比如刷新后
+                // 接续的旧任务），无条件清会把它们的停止按钮一起收走。
+                clearRunningNodeIdIfIdle(nodeId);
             }
         },
-        [applyImageItem, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
+        [applyImageItem, clearRunningNodeIdIfIdle, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -3287,10 +3328,10 @@ function InfiniteCanvasPage() {
                 );
             } finally {
                 finishGenerationRequest(node.id, controller);
-                setRunningNodeId(null);
+                clearRunningNodeIdIfIdle(node.id);
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
+        [clearRunningNodeIdIfIdle, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {
