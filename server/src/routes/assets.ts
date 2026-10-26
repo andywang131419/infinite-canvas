@@ -23,6 +23,7 @@ import { currentUser, requireAuth, type AuthVariables } from "../auth/middleware
 import { ApiError } from "../http/errors";
 import { ok } from "../http/respond";
 import { openAsset, putAsset, removeAsset } from "../services/asset-service";
+import { extensionFromMime } from "../storage/key";
 import type { AssetRow } from "../db/repos/assets";
 
 /** 受保护路由的 handler 类型（避免手写 `Context<{Variables: ...}>`）。 */
@@ -120,13 +121,34 @@ const serveAsset: AuthedHandler = async (c) => {
     const end = opened.range.end ?? opened.size;
     const length = Math.max(0, end - start);
 
+    /**
+     * 输出侧的第二道闸（QA P0-2）。
+     *
+     * 第一道闸在 `asset-service.normalizeMime`（落库前白名单归一），但它管不了
+     * **已经在库里的历史脏数据**。这里再按"归一后的 mime 是否可内联展示"决定两件事：
+     *
+     * 1. `Content-Disposition`：媒体用 `inline`（`<img>`/`<video>` 要能直接渲染），
+     *    兜底的 octet-stream 用 `attachment`（只允许下载，不允许当文档打开）；
+     * 2. `Content-Security-Policy: default-src 'none'; sandbox`：
+     *    即使浏览器把响应当成 HTML 解析，`sandbox` + `default-src 'none'`
+     *    也会禁掉脚本执行与一切子资源加载，从而把"存储型 XSS"降级为死页面。
+     *
+     * 注意 `X-Content-Type-Options: nosniff` 单独存在时**不够** ——
+     * 因为 Content-Type 是我们自己写给浏览器的，声明了 `text/html` 就等于授权执行。
+     */
+    const mime = opened.row.mime || "application/octet-stream";
+    const isInlineSafe = mime !== "application/octet-stream";
+    const disposition = `${isInlineSafe ? "inline" : "attachment"}; filename="${opened.row.sha256}.${extensionFromMime(mime)}"`;
+
     const headers = new Headers({
-        "Content-Type": opened.row.mime || "application/octet-stream",
+        "Content-Type": mime,
         "Content-Length": String(length),
         "Accept-Ranges": "bytes",
         ETag: etag,
         "Cache-Control": "private, max-age=31536000, immutable",
         "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": disposition,
+        "Content-Security-Policy": "default-src 'none'; sandbox",
     });
 
     if (opened.partial) {

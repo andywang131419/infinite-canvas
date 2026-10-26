@@ -87,12 +87,22 @@ SELECT id, owner_id, canvas_id, job_id, kind, storage_driver, storage_key, mime,
 
 const SQL_DELETE_ASSET_BY_KEY = `DELETE FROM assets WHERE storage_key = ? AND owner_id = ?`;
 
+/**
+ * 按画布列举资产。
+ *
+ * **owner 过滤下沉到 SQL**（QA P2-6）：`assets.canvas_id` 是"按画布列举"的便利字段，
+ * 本身不带归属语义。仅按 `canvas_id` 查会让安全性完全依赖调用方先做归属校验，
+ * 因此这里 JOIN `canvases` 并显式比对 `owner_id`。
+ *
+ * 参数顺序：1. owner_id  2. canvas_id
+ */
 const SQL_LIST_ASSETS_BY_CANVAS = `
-SELECT id, owner_id, canvas_id, job_id, kind, storage_driver, storage_key, mime, bytes,
-       width, height, duration_ms, sha256, prompt, model, meta, created_at
-  FROM assets
- WHERE canvas_id = ?
- ORDER BY created_at ASC
+SELECT a.id, a.owner_id, a.canvas_id, a.job_id, a.kind, a.storage_driver, a.storage_key, a.mime, a.bytes,
+       a.width, a.height, a.duration_ms, a.sha256, a.prompt, a.model, a.meta, a.created_at
+  FROM assets a
+  JOIN canvases c ON c.id = a.canvas_id AND c.owner_id = ?
+ WHERE a.canvas_id = ?
+ ORDER BY a.created_at ASC
 `;
 
 /**
@@ -164,9 +174,9 @@ export function deleteAssetByStorageKey(ownerId: string, storageKey: string): nu
     return Number(result.changes);
 }
 
-/** 列出某画布下的资产。 */
-export function listAssetsByCanvas(canvasId: string): AssetRow[] {
-    return getDb().query(SQL_LIST_ASSETS_BY_CANVAS).all(canvasId) as AssetRow[];
+/** 列出某画布下的资产（仅该 owner 的）。 */
+export function listAssetsByCanvas(ownerId: string, canvasId: string): AssetRow[] {
+    return getDb().query(SQL_LIST_ASSETS_BY_CANVAS).all(ownerId, canvasId) as AssetRow[];
 }
 
 /** 统计同一内容被多少行引用（决定能否删物理文件）。 */

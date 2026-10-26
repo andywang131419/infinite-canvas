@@ -39,12 +39,15 @@ VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
  * - `AND deleted_at IS NULL`：已软删的画布不能被并发复活；
  * - `RETURNING revision, updated_at`：写入成功时直接拿到新版本号，
  *   返回 0 行即代表 `changes = 0` → 上层返回 409 `REVISION_CONFLICT`。
+ * - `title = COALESCE(?, title)`：**请求没带标题（传 NULL）时保留库里已有的命名**
+ *   （QA P2-2）。原先无条件 `title = ?` 会让"不带 title 的自动保存"
+ *   把用户起好的名字覆盖成"未命名画布"。
  *
  * 因为是**单条 SQL**，SQLite 的写锁保证 20 个并发 PUT 里只有 1 个能命中 WHERE，
  * 其余必然 0 行 —— 这正是验收要求的"仅 1 个成功"。
  *
  * 参数顺序：
- * 1. doc  2. node_count  3. title  4. updated_by_device  5. updated_at
+ * 1. doc  2. node_count  3. title（可为 NULL）  4. updated_by_device  5. updated_at
  * 6. id  7. owner_id  8. base_revision（客户端提交的 baseRevision）
  */
 export const SQL_UPDATE_CANVAS_CAS = `
@@ -52,7 +55,7 @@ UPDATE canvases
    SET doc = ?,
        revision = revision + 1,
        node_count = ?,
-       title = ?,
+       title = COALESCE(?, title),
        updated_by_device = ?,
        updated_at = ?
  WHERE id = ?
@@ -123,6 +126,18 @@ SELECT c.id, c.title, c.revision, c.node_count, c.thumbnail_asset_id,
  LIMIT ? OFFSET ?
 `;
 
+/**
+ * 该用户的画布总数（不含已软删）。用于列表接口的 `total`（QA P2-1）。
+ *
+ * 参数顺序：1. owner_id
+ */
+export const SQL_COUNT_CANVASES = `
+SELECT COUNT(*) AS total
+  FROM canvases
+ WHERE owner_id = ?
+   AND deleted_at IS NULL
+`;
+
 // =============================================================================
 // jobs（T02 只读，写入在 T03）
 // =============================================================================
@@ -130,15 +145,21 @@ SELECT c.id, c.title, c.revision, c.node_count, c.thumbnail_asset_id,
 /**
  * 某画布当前未完成的任务（详情接口一次性返回，避免前端二次往返）。
  *
- * 参数顺序：1. canvas_id
+ * **owner 过滤下沉到 SQL**（QA P2-6）：原先只按 `canvas_id` 查，
+ * 安全性完全依赖"调用方一定先做过归属校验"这一调用顺序约定 ——
+ * T03 一旦新增路由就可能变成 IDOR。JOIN 一次的成本可以忽略，
+ * 但把不变量从"靠约定"变成"靠 SQL"。
+ *
+ * 参数顺序：1. owner_id  2. canvas_id
  */
 export const SQL_SELECT_OPEN_JOBS = `
-SELECT id, node_id, type, capability, model, status, progress, stage,
-       error_code, error_message, created_at, started_at, updated_at
-  FROM jobs
- WHERE canvas_id = ?
-   AND status IN ('queued', 'running')
- ORDER BY created_at ASC
+SELECT j.id, j.node_id, j.type, j.capability, j.model, j.status, j.progress, j.stage,
+       j.error_code, j.error_message, j.created_at, j.started_at, j.updated_at
+  FROM jobs j
+  JOIN canvases c ON c.id = j.canvas_id AND c.owner_id = ?
+ WHERE j.canvas_id = ?
+   AND j.status IN ('queued', 'running')
+ ORDER BY j.created_at ASC
 `;
 
 // =============================================================================

@@ -138,7 +138,7 @@ services:
 
     # -------------------------------------------------------------------------
     # backup：每日 sqlite3 .backup → gzip → rclone → 远端，14 天滚动
-    # 与 server 共享 data 卷（只读 DB、写 /data/backups）
+    # 与 server 共享 data 卷（sqlite3 只读快照主库，写 /data/backups）
     # -------------------------------------------------------------------------
     backup:
         build:
@@ -153,6 +153,13 @@ services:
             BACKUP_RETRY: ${BACKUP_RETRY:-3}
             BACKUP_TARGET_LABEL: ${BACKUP_TARGET_LABEL:-}
             DATABASE_PATH: ${DATABASE_PATH:-/data/app.db}
+            # 【必须传】否则 backup.sh 里 INCLUDE_MEDIA 恒为 false，
+            # 备份只覆盖 app.db，而 /data/media 下所有图片/视频**零备份**（QA P1-3）。
+            # 媒体是全量 tar 打包：大磁盘场景注意 tar 期间的临时峰值（约等于媒体总量）。
+            BACKUP_INCLUDE_MEDIA: ${BACKUP_INCLUDE_MEDIA:-true}
+            # 与 server 保持一致，否则媒体目录改了根路径后备份会打空包
+            STORAGE_LOCAL_ROOT: ${STORAGE_LOCAL_ROOT:-/data/media}
+            BACKUP_STAGE_DIR: ${BACKUP_STAGE_DIR:-/data/backups}
             # 远端目标留空 = 只做本地备份（/data/backups），不上传
             RCLONE_REMOTE: ${RCLONE_REMOTE:-}
             RCLONE_DEST: ${RCLONE_DEST:-}
@@ -168,7 +175,9 @@ services:
             - ic
 
 volumes:
-    # 单卷策略：app.db + -wal + media + backups 全在 /data，便于整体打包迁移
+    # 单卷策略：app.db（含 -wal/-shm）+ media + backups 全在 /data，便于整体打包迁移。
+    # 注意：**能不能把 media 一起打包取决于 BACKUP_INCLUDE_MEDIA**（默认 true，
+    # 见上方 backup 服务），不是说"都在 /data"就等于"都被备份"（QA P1-3）。
     data:
     caddy_data:
     caddy_config:

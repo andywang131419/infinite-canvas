@@ -12,7 +12,7 @@
 
 | 触发方式 | 执行者 | 时机 | 快照手段 | 媒体打包 | 写 `backups` 审计行 |
 |---|---|---|---|---|---|
-| 定时（cron） | `deploy/backup` 容器（`backup.sh`） | `BACKUP_CRON`（默认每天 03:00） | `sqlite3 .backup` | `BACKUP_INCLUDE_MEDIA=true` 时 tar | 是（`trigger='cron'`） |
+| 定时（cron） | `deploy/backup` 容器（`backup.sh`） | `BACKUP_CRON`（默认每天 03:00） | `sqlite3 .backup` | 默认打包（`BACKUP_INCLUDE_MEDIA=true`） | 是（`trigger='cron'`） |
 | 手动 | 服务端进程（`POST /api/backups/run`） | 你在设置页点一下 / curl | `VACUUM INTO` | ✗（只统计，不打包） | 是（`trigger='manual'`） |
 
 为什么手动备份不直接调 `backup.sh`：服务端镜像里**没有** `sqlite3` CLI（只有 Bun 运行时）。
@@ -20,7 +20,12 @@
 
 **媒体文件（`/data/media`）只有 cron 容器会打包。** 手动备份只统计文件数与字节数，
 写进审计行便于估算体量 —— 如果你只用手动备份，恢复时图片/视频会全部变成 404（数据库里
-有元数据、磁盘上没文件）。**务必保证 cron 容器的 `BACKUP_INCLUDE_MEDIA=true`。**
+有元数据、磁盘上没文件）。
+
+> ⚠️ `BACKUP_INCLUDE_MEDIA` 的默认值已改为 **true**（compose 与 `backup.sh` 都是），
+> 因为媒体就是用户真正的数据。**除非你在别处另有对象存储备份，否则不要关它。**
+> 媒体是全量 tar，磁盘峰值约等于"媒体总量 + 数据总量"。
+
 
 产物位置：
 

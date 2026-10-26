@@ -14,7 +14,7 @@ import { currentUser, requireAuth, type AuthVariables } from "../auth/middleware
 import { getEnv } from "../env";
 import { readJsonBody } from "../http/request";
 import { ok } from "../http/respond";
-import { deleteCanvas, getCanvasDetail, getCanvasList, getCanvasRevision, putCanvas } from "../services/canvas-service";
+import { countCanvases, deleteCanvas, getCanvasDetail, getCanvasList, getCanvasRevision, putCanvas } from "../services/canvas-service";
 
 export const canvasRoutes = new Hono<{ Variables: AuthVariables }>();
 
@@ -53,7 +53,9 @@ canvasRoutes.get("/canvases", (c) => {
 
     const items = getCanvasList(user.id, Number.isFinite(limit) ? limit : 100, Number.isFinite(offset) ? offset : 0);
 
-    return ok(c, { items, total: items.length });
+    // `total` 必须是**该用户的画布总数**，不是本页条数（QA P2-1）：
+    // 否则前端按它算页数时永远只有 1 页。
+    return ok(c, { items, total: countCanvases(user.id) });
 });
 
 /**

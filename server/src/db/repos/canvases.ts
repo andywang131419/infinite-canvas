@@ -7,6 +7,7 @@
 
 import { getDb } from "../client";
 import {
+    SQL_COUNT_CANVASES,
     SQL_INSERT_CANVAS,
     SQL_SELECT_CANVAS_DETAIL,
     SQL_SELECT_CANVAS_LIST,
@@ -96,7 +97,10 @@ export type UpdateCanvasCasInput = {
     /** 清洗后、已序列化的 doc JSON 字符串。 */
     doc: string;
     nodeCount: number;
-    title: string;
+    /**
+     * 新标题；`null` 表示"本次请求没带标题"，SQL 里用 `COALESCE(?, title)` 保留原值。
+     */
+    title: string | null;
     deviceLabel?: string | null;
 };
 
@@ -141,6 +145,12 @@ export function listCanvases(ownerId: string, limit = 100, offset = 0): CanvasSu
     return getDb().query(SQL_SELECT_CANVAS_LIST).all(ownerId, limit, offset) as CanvasSummaryRow[];
 }
 
+/** 该用户的画布总数（不含已软删），与 {@link listCanvases} 的过滤条件一致。 */
+export function countCanvasRows(ownerId: string): number {
+    const row = getDb().query(SQL_COUNT_CANVASES).get(ownerId) as { total: number } | null;
+    return row?.total ?? 0;
+}
+
 /**
  * 软删。
  *
@@ -152,7 +162,11 @@ export function softDeleteCanvas(ownerId: string, id: string): number {
     return Number(result.changes);
 }
 
-/** 该画布未完成的任务（详情接口一次返回）。 */
-export function listOpenJobs(canvasId: string): OpenJobRow[] {
-    return getDb().query(SQL_SELECT_OPEN_JOBS).all(canvasId) as OpenJobRow[];
+/**
+ * 该画布未完成的任务（详情接口一次返回）。
+ *
+ * 带 `ownerId`：归属过滤下沉到 SQL（QA P2-6），不再依赖调用方的校验顺序。
+ */
+export function listOpenJobs(ownerId: string, canvasId: string): OpenJobRow[] {
+    return getDb().query(SQL_SELECT_OPEN_JOBS).all(ownerId, canvasId) as OpenJobRow[];
 }

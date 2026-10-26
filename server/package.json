@@ -15,7 +15,8 @@
         "typecheck": "tsc --noEmit",
         "user:create": "bun run scripts/create-user.ts",
         "verify:t02": "node scripts/verify-t02.mjs",
-        "verify:t03": "node scripts/verify-t03.mjs"
+        "verify:t03": "node scripts/verify-t03.mjs",
+        "verify:fix": "node scripts/verify-fix-p01.mjs"
     },
     "dependencies": {
         "hono": "^4.6.14",

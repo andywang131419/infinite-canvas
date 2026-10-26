@@ -36,6 +36,10 @@ import { getStorageDriver } from "../storage";
 import { deriveObjectRelPath, generateStorageKey, kindFromPrefix, parseStorageKey, type StorageKeyPrefix } from "../storage/key";
 import { StorageObjectNotFoundError, StorageRangeError } from "../storage/types";
 import type { IngestedAsset } from "./doc-sanitizer";
+import { canonicalAssetMime, OCTET_STREAM_MIME } from "./mime-whitelist";
+
+/** 资产种类（与 `assets.kind` 的 CHECK 约束一致）。 */
+type AssetKind = "image" | "video" | "audio" | "file";
 
 /** 把 storageKey 前缀映射回"新建资产时该用的前缀"。 */
 function prefixForMime(mime: string, fallback: StorageKeyPrefix = "image"): StorageKeyPrefix {
@@ -45,6 +49,18 @@ function prefixForMime(mime: string, fallback: StorageKeyPrefix = "image"): Stor
     if (base.startsWith("audio/")) return "audio";
     if (base.length > 0) return "file";
     return fallback;
+}
+
+/**
+ * 由「storageKey 前缀 + 归一后的 MIME」决定 `assets.kind`。
+ *
+ * 规则（QA P0-2 的落地）：**MIME 被归一成 octet-stream 时一律 `kind=file`**。
+ * 否则会出现「`kind=image` 但实际内容是 HTML」这种自相矛盾的行，
+ * 未来任何按 `kind` 决定"能不能内联展示"的代码都会踩到它。
+ */
+function kindFor(prefix: StorageKeyPrefix, mime: string): AssetKind {
+    if (mime === OCTET_STREAM_MIME) return "file";
+    return kindFromPrefix(prefix);
 }
 
 /** sha256（十六进制）。与驱动内部算法一致，便于"先算哈希再决定要不要写盘"。 */
@@ -69,6 +85,10 @@ export async function ingestAssetBytes(
     const sha256 = sha256Of(payload.bytes);
     const driver = getStorageDriver();
 
+    // 白名单在**落盘之前**生效：内容来自 doc 内联 base64 或 T03 上游响应，
+    // 上游/客户端声明的类型不可信（QA P0-2）。非白名单 → octet-stream + kind=file。
+    const mime = canonicalAssetMime(payload.mime) ?? OCTET_STREAM_MIME;
+
     // ---- 1. 先按内容查：同内容只落一份 ----
     const existing = findAssetBySha(sha256, driver.name);
     if (existing) {
@@ -77,16 +97,16 @@ export async function ingestAssetBytes(
 
     // ---- 2. 落盘（内容寻址）----
     const createdAt = new Date().toISOString();
-    const prefix = prefixForMime(payload.mime);
+    const prefix = prefixForMime(mime);
     const storageKey = generateStorageKey(prefix);
 
-    const written = await driver.put({ bytes: payload.bytes, mime: payload.mime, createdAt });
+    const written = await driver.put({ bytes: payload.bytes, mime, createdAt });
 
     // ---- 3. 登记元数据 ----
     upsertAsset({
         ownerId,
         canvasId: canvasId ?? null,
-        kind: kindFromPrefix(prefix),
+        kind: kindFor(prefix, mime),
         storageDriver: driver.name,
         storageKey,
         mime: written.mime,
@@ -158,7 +178,7 @@ export async function putAsset(
     return upsertAsset({
         ownerId,
         canvasId: canvasId ?? null,
-        kind: kindFromPrefix(parsed.prefix),
+        kind: kindFor(parsed.prefix, mime),
         storageDriver: driver.name,
         storageKey: parsed.raw,
         mime: written.mime,
@@ -277,17 +297,44 @@ export function relPathFor(row: AssetRow): string {
 }
 
 /**
- * MIME 归一化。
+ * MIME 归一化（**默认拒绝**，QA P0-2 的核心执行点）。
  *
- * 客户端有时把图片当 `application/octet-stream` 传（尤其是从 Blob 直接 PUT），
- * 这时按 storageKey 前缀兜底，避免存进去的 mime 全是 octet-stream。
+ * 三种输入要分开处理：
+ *
+ * 1. **未声明**（空）或 `application/octet-stream`：
+ *    前端从 `Blob` 直接 PUT 时常常不带 `Content-Type`。这时按 storageKey 前缀兜底
+ *    （`image` → `image/png` …），否则存进去的 mime 全是 octet-stream，
+ *    `<img>` 无法内联显示，前端体验会明显变差。
+ * 2. **声明了且在白名单内**：归一成标准写法（`image/jpg` → `image/jpeg`）。
+ * 3. **声明了但不在白名单**（`text/html`、`image/svg+xml`…）：
+ *    一律降级为 `application/octet-stream`，**不再参考 storageKey 前缀** ——
+ *    调用方给的 key 前缀是用户可控的，不能拿它来"证明"内容类型。
+ *
+ * @param declared 原始 `Content-Type` 头。
+ * @param prefix 已校验过的 storageKey 前缀（仅用于第 1 种情况的兜底）。
  */
 function normalizeMime(declared: string, prefix: StorageKeyPrefix): string {
-    const base = (declared || "").split(";")[0]!.trim().toLowerCase();
-    if (base.length > 0 && base !== "application/octet-stream") return base;
+    const canonical = canonicalAssetMime(declared);
+    const declaredBase = (declared || "").split(";")[0]!.trim().toLowerCase();
+    const unspecified = declaredBase.length === 0 || declaredBase === OCTET_STREAM_MIME;
 
-    if (prefix === "image") return "image/png";
-    if (prefix === "video") return "video/mp4";
-    if (prefix === "audio") return "audio/mpeg";
-    return "application/octet-stream";
+    if (unspecified) {
+        if (prefix === "image") return "image/png";
+        if (prefix === "video") return "video/mp4";
+        if (prefix === "audio") return "audio/mpeg";
+        return OCTET_STREAM_MIME;
+    }
+
+    // 白名单之外的声明值（含 text/html、image/svg+xml 等可执行内容）→ 只保留字节。
+    return canonical ?? OCTET_STREAM_MIME;
+}
+
+/**
+ * 供路由/测试复用的导出（避免把归一规则散落到多处）。
+ *
+ * @param declared 原始 `Content-Type` 头。
+ * @param prefix 已校验过的 storageKey 前缀。
+ */
+export function resolveAssetMime(declared: string, prefix: StorageKeyPrefix): string {
+    return normalizeMime(declared, prefix);
 }

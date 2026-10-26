@@ -14,7 +14,7 @@
 #   BACKUP_RETRY             失败重试次数（默认 3）
 #   RCLONE_REMOTE            远端名（留空 = 不上传）
 #   RCLONE_DEST              远端目录
-#   BACKUP_INCLUDE_MEDIA     true 时额外打包媒体目录
+#   BACKUP_INCLUDE_MEDIA     true 时额外打包媒体目录（默认 true；关掉意味着媒体零备份）
 #   STORAGE_LOCAL_ROOT       媒体根目录（默认 /data/media）
 # =============================================================================
 set -eu
@@ -24,7 +24,8 @@ STORAGE_LOCAL_ROOT="${STORAGE_LOCAL_ROOT:-/data/media}"
 STAGE_DIR="${BACKUP_STAGE_DIR:-/data/backups}"
 KEEP_DAYS="${BACKUP_DB_KEEP_DAYS:-14}"
 RETRY="${BACKUP_RETRY:-3}"
-INCLUDE_MEDIA="${BACKUP_INCLUDE_MEDIA:-false}"
+# 默认 true：媒体就是用户真正的数据，恢复时缺了它画布里全是 404（QA P1-3）。
+INCLUDE_MEDIA="${BACKUP_INCLUDE_MEDIA:-true}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 RCLONE_DEST="${RCLONE_DEST:-}"
 TARGET_LABEL="${BACKUP_TARGET_LABEL:-}"
@@ -66,6 +67,42 @@ VALUES ('$audit_id', 'cron', '$audit_status_esc', ${audit_db_bytes:-0}, ${audit_
 SQL
 }
 
+# -----------------------------------------------------------------------------
+# 退出兜底（QA P1-5）
+#
+# 问题：`set -eu` 下任何意外失败（mkdir 失败、gzip 失败、磁盘写满、tar 被打断、
+# 收到 SIGTERM…）都会**直接退出且不写审计行** —— `backups` 表里看不到这次失败，
+# 运维只能翻 docker logs，等于备份静默失败。
+#
+# 方案：入口即注册 EXIT trap（在第一次可能失败的 `mkdir` **之前**），
+# 凡未正常走完主流程的退出都补一条 failed 审计行，并清掉半截的 .gz
+# （否则要等 14 天后的 -mtime 才会被扫掉）。
+# 正常/显式失败路径会先把 FINISHED 置 1（它们自己已经写过审计行），避免重复记录。
+#
+# 说明：POSIX sh 拿不到"出错的行号"（trap 里的 `$LINENO` 指向 trap 自身），
+# 因此错误信息记录的是退出码而不是行号 —— 宁可准确，不要编一个假行号。
+# -----------------------------------------------------------------------------
+FINISHED=0
+TMP_DB=""
+DB_OUT=""
+
+cleanup() {
+    if [ -n "$TMP_DB" ]; then rm -f "$TMP_DB"; fi
+}
+
+on_exit() {
+    status=$?
+    cleanup
+    if [ "$FINISHED" -ne 1 ]; then
+        if [ -n "$DB_OUT" ]; then rm -f "$DB_OUT" 2>/dev/null || true; fi
+        record_audit "failed" 0 0 0 "aborted (exit=$status)"
+        err "备份异常中断（exit=$status），已写入 failed 审计行并清理半截产物"
+    fi
+}
+
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
 mkdir -p "$STAGE_DIR"
 
 # -----------------------------------------------------------------------------
@@ -73,19 +110,19 @@ mkdir -p "$STAGE_DIR"
 # -----------------------------------------------------------------------------
 if [ ! -f "$DATABASE_PATH" ]; then
     warn "数据库不存在：$DATABASE_PATH（服务可能尚未首次启动）→ 本次跳过"
+    FINISHED=1
     exit 0
 fi
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
     err "找不到 sqlite3 CLI，无法做在线安全快照"
+    # 没有 sqlite3 就写不了审计行，直接跳过 trap 里的补偿逻辑。
+    FINISHED=1
     exit 1
 fi
 
 TMP_DB="$STAGE_DIR/.snapshot-$STAMP.sqlite"
 DB_OUT="$STAGE_DIR/app-$STAMP.sqlite.gz"
-
-cleanup() { rm -f "$TMP_DB"; }
-trap cleanup EXIT INT TERM
 
 # -----------------------------------------------------------------------------
 # 1. 在线快照（带重试：并发写可能让 .backup 暂时拿不到锁）
@@ -106,6 +143,7 @@ done
 if [ "$ok" -ne 1 ]; then
     err "快照连续失败 $RETRY 次，放弃本次备份"
     record_audit "failed" 0 0 0 "snapshot failed after $RETRY attempts"
+    FINISHED=1
     exit 1
 fi
 
@@ -146,6 +184,7 @@ if [ -n "$RCLONE_REMOTE" ]; then
     if ! command -v rclone >/dev/null 2>&1; then
         err "RCLONE_REMOTE 已设置但找不到 rclone 命令"
         record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone missing"
+        FINISHED=1
         exit 1
     fi
     REMOTE_TARGET="$RCLONE_REMOTE:$RCLONE_DEST"
@@ -157,6 +196,7 @@ if [ -n "$RCLONE_REMOTE" ]; then
     else
         err "rclone 上传失败（本地备份已保留，可人工补传）"
         record_audit "failed" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" "rclone upload failed"
+        FINISHED=1
         exit 1
     fi
 else
@@ -164,5 +204,6 @@ else
 fi
 
 record_audit "success" "$DB_BYTES" "$MEDIA_FILES" "$MEDIA_BYTES" ""
+FINISHED=1
 log "备份成功"
 exit 0

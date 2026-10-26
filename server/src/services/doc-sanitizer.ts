@@ -19,10 +19,16 @@
  * 3. 整个 doc 体积超限 → 由 http 层返回 413（本模块只负责清洗）
  *
  * ---------------------------------------------------------------------------
- * 本文件同样是**零依赖纯模块**（不 import 任何东西），可用
- * `node --experimental-strip-types` 直接跑单测。
+ * 关于依赖：本文件只 import 两个**同样零依赖的纯模块**
+ * （`./mime-whitelist.ts` 与 `../storage/key.ts`，均带 `.ts` 后缀），
+ * 因此仍可用 `node --experimental-strip-types` 直接跑单测。
+ * 白名单必须与 `asset-service.ts` 共用同一份 —— 否则"doc 侧放行、资产侧拒绝"
+ * 这类不对称会直接变成绕过点（QA P0-2 / P2-4）。
  * ---------------------------------------------------------------------------
  */
+
+import { isAllowedAssetMime, canonicalAssetMime, OCTET_STREAM_MIME } from "./mime-whitelist.ts";
+import { looksLikeStorageKey } from "../storage/key.ts";
 
 /** 单个 data URL 的载荷。 */
 export type DataUrlPayload = {
@@ -80,14 +86,54 @@ export type SanitizeResult = {
  * - `content`：`CanvasNodeMetadata.content` / `CanvasNodeImage.content`（图片节点存 URL）
  * - `dataUrl`：`CanvasAssistantReference.dataUrl` / `CanvasAssistantImage.dataUrl`
  * - `url` / `coverUrl` / `previewUrl` / `thumbnail` / `src`：素材库与导出路径
+ *
+ * ⚠️ `content` 是**双义字段**：图片节点里它是媒体 URL，文本节点里它是正文。
+ * 因此命中本集合之前必须先过 {@link isTextFieldName}（QA P2-3）。
  */
 const MEDIA_FIELD_NAMES = new Set(["content", "dataUrl", "url", "coverUrl", "previewUrl", "thumbnail", "src"]);
+
+/**
+ * **纯文本**字段名：即使内容以 `data:` / `blob:` 开头也一律原样保留。
+ *
+ * 这些字段在协议里的语义就是"给人看的字符串"，把其中的 `data:` 当成载荷
+ * 会导致正文被清空（QA P2-3 的实测：`{type:'text', metadata:{content:'blob:abc 是我的笔记正文'}}`
+ * 曾被清成空串）。真实的二进制永远不会出现在这些字段里 ——
+ * 图片节点用的是 `content`（且节点 `type !== 'text'`）。
+ */
+const TEXT_FIELD_NAMES = new Set(["prompt", "composerContent", "errorDetails", "title", "text", "label", "description"]);
+
+/** 该字段是否是"纯文本"字段（`content` 仅在文本节点下算）。 */
+function isTextFieldName(key: string, nodeType: string | null): boolean {
+    if (TEXT_FIELD_NAMES.has(key)) return true;
+    return key === "content" && nodeType === "text";
+}
 
 /** 递归最大深度（防御畸形/循环引用数据）。 */
 const MAX_DEPTH = 64;
 
+/**
+ * 裸字符串被当成内联载荷的最小长度。
+ *
+ * 未知字段（插件节点的自定义字段）里的字符串无从判断语义，只能用长度兜底：
+ * 真正的内联图片 base64 至少几百字符，而 `"data:image/png;base64, 是这么写的"`
+ * 这种正文通常很短。短于阈值的字符串一律按文本保留（QA P2-3）。
+ *
+ * 注意：`content` / `dataUrl` 等**已知媒体字段**不受此阈值限制 ——
+ * 那些字段里的 data URL 一定是载荷。
+ */
+const BARE_DATA_URL_MIN_LENGTH = 128;
+
 /** `data:<mime>;base64,<payload>`；mime 可省略。 */
 const DATA_URL_PATTERN = /^data:([A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+)?(?:;[^,]*)?;base64,/i;
+
+/**
+ * `blob:` 临时 URL 的**严格**形状。
+ *
+ * 必须带 `scheme://`（如 `blob:http://localhost:3000/2f1c…`）或 `blob:null/…`，
+ * 且整体不允许空白。这样 `"blob:abc 是我的笔记正文"` 这种**正文**不会被误判为
+ * 死链而清空（QA P2-3）。
+ */
+const BLOB_URL_PATTERN = /^blob:(?:[a-z][a-z0-9+.-]*:\/\/\S*|null\/\S*)$/i;
 
 /** 是否 data URL。 */
 export function isDataUrl(value: unknown): value is string {
@@ -96,13 +142,34 @@ export function isDataUrl(value: unknown): value is string {
 
 /** 是否 `blob:` 临时 URL。 */
 export function isBlobUrl(value: unknown): value is string {
-    return typeof value === "string" && /^blob:/i.test(value);
+    return typeof value === "string" && BLOB_URL_PATTERN.test(value);
+}
+
+/**
+ * 取出 data URL 头里声明的 MIME（**不解码**，仅用于白名单预检）。
+ *
+ * @returns 小写 MIME；不是 data URL 或头里没有 MIME 时返回 `null`。
+ */
+export function dataUrlMime(value: string): string | null {
+    const matched = DATA_URL_PATTERN.exec(value);
+    if (!matched) return null;
+
+    const commaAt = value.indexOf(",");
+    const header = commaAt < 0 ? value : value.slice(0, commaAt);
+    const declared = /^data:([A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+)/i.exec(header)?.[1];
+    const mime = (declared ?? matched[1] ?? "").toLowerCase();
+    return mime.length > 0 ? mime : null;
 }
 
 /**
  * 拆解 data URL。
  *
- * @returns `{ mime, bytes }`；不是合法 data URL 或 base64 解码失败时返回 `null`。
+ * **白名单前置**（QA P0-2 / P2-4）：内联 base64 与直接 PUT 走的是同一条落库通道，
+ * 若这里不设防，`data:text/html;base64,<script>…` 会绕过 `PUT /api/assets` 的归一逻辑
+ * 直接进库，再由 `/api/assets/raw` 同源直出。
+ *
+ * @returns `{ mime, bytes }`；不是合法 data URL、MIME 不在白名单、
+ *          或 base64 解码失败时返回 `null`（调用方计 `dropped`）。
  */
 export function decodeDataUrl(value: string, fallbackMime = "image/png"): DataUrlPayload | null {
     const matched = DATA_URL_PATTERN.exec(value);
@@ -113,7 +180,12 @@ export function decodeDataUrl(value: string, fallbackMime = "image/png"): DataUr
 
     const header = value.slice(0, commaAt);
     const declared = /^data:([A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+)/i.exec(header)?.[1];
-    const mime = (declared ?? matched[1] ?? fallbackMime).toLowerCase();
+    const declaredMime = (declared ?? matched[1] ?? fallbackMime).toLowerCase();
+
+    // 与 asset-service 共用同一份白名单；octet-stream 的 data URL 无法判断真实内容，
+    // 一律当"不可信"丢弃（真二进制请走 PUT /api/assets，那里会按 storageKey 前缀兜底）。
+    const mime = canonicalAssetMime(declaredMime);
+    if (!mime || mime === OCTET_STREAM_MIME) return null;
 
     const base64 = value.slice(commaAt + 1);
     const bytes = decodeBase64(base64);
@@ -169,14 +241,24 @@ export async function sanitizeCanvasDoc(doc: unknown, ingest: IngestFn | null): 
 /** 递归主体。 */
 async function walk(value: unknown, stats: SanitizeStats, ingest: IngestFn | null, depth: number): Promise<unknown> {
     if (depth > MAX_DEPTH) {
-        pushWarning(stats, `doc 嵌套层级超过 ${MAX_DEPTH}，已截断`);
-        return value;
+        /**
+         * 深度超限时**不能原样返回**（QA P1-1 A）。
+         *
+         * 原先 `return value` 意味着：把 base64 埋到第 65 层就能整棵子树原样入库，
+         * `stats.dropped` 仍为 0，连 `x-doc-dropped` 都不会提示。
+         * 现在的语义是"这棵子树已知不可控 → 整棵丢弃并计数"，
+         * 与文件头声明的「返回的 doc 中任何位置都不再出现 data:*;base64,」保持一致。
+         */
+        stats.dropped += 1;
+        pushWarning(stats, `doc 嵌套层级超过 ${MAX_DEPTH}，该子树已丢弃`);
+        return null;
     }
 
     if (typeof value === "string") {
         // 裸字符串：出现在"未知位置"（例如插件节点的自定义字段）。
         // 成功落盘时替换为 storageKey，保留可恢复性；否则置空。
-        if (isDataUrl(value)) {
+        // 只有**够长的** data URL 才当载荷 —— 短字符串更可能是正文（QA P2-3）。
+        if (isDataUrl(value) && value.length >= BARE_DATA_URL_MIN_LENGTH) {
             const storageKey = await tryIngest(value, stats, ingest, "未知字段");
             return storageKey ?? "";
         }
@@ -199,12 +281,37 @@ async function walk(value: unknown, stats: SanitizeStats, ingest: IngestFn | nul
 
     const source = value as Record<string, unknown>;
     const output: Record<string, unknown> = {};
-    /** 该对象是否已有 storageKey 字段（决定 data URL 要不要顺手补一个）。 */
-    const hadStorageKey = typeof source.storageKey === "string" && source.storageKey.length > 0;
+    /**
+     * 该对象是否已有 storageKey 字段（决定 data URL 要不要顺手补一个）。
+     *
+     * 判据必须是 `looksLikeStorageKey` 而不是"是个非空字符串"：
+     * 一个 `storageKey: "data:image/png;base64,…"` 的脏节点不该被视为"已有键"，
+     * 否则它下面真正提取出来的 storageKey 就不会被补写（QA P1-1 B）。
+     */
+    const hadStorageKey = looksLikeStorageKey(source.storageKey);
+    /** 节点类型（`type === 'text'` 时 `content` 表示正文，不是媒体）。 */
+    const nodeType = typeof source.type === "string" ? source.type : null;
 
     for (const [key, raw] of Object.entries(source)) {
-        // storageKey 本身永远原样保留（它的合法性由 assets 表读取时再校验）。
+        /**
+         * `storageKey` 的合法性由 assets 表读取时再校验，但**不能无条件透传**（QA P1-1 B）：
+         * 它不在 `MEDIA_FIELD_NAMES` 里，原先 `data:image/png;base64,…` 会被原样写库，
+         * 直接反证了「DB 里绝不出现 data:」这条底线。
+         */
         if (key === "storageKey") {
+            if (typeof raw === "string" && raw.length > 0 && !looksLikeStorageKey(raw) && /^(?:data|blob):/i.test(raw)) {
+                stats.dropped += 1;
+                pushWarning(stats, "storageKey 处存在非法的 data:/blob: 值，已置空");
+                // 若本轮已经提取出合法 key（字段顺序在 content 之后），不要把它覆盖掉。
+                if (!looksLikeStorageKey(output.storageKey)) output.storageKey = "";
+                continue;
+            }
+            output[key] = raw;
+            continue;
+        }
+
+        // 纯文本字段（prompt / 文本节点正文 / errorDetails…）原样保留，绝不清洗（QA P2-3）。
+        if (typeof raw === "string" && isTextFieldName(key, nodeType)) {
             output[key] = raw;
             continue;
         }
@@ -282,6 +389,14 @@ async function tryIngest(
     ingest: IngestFn | null,
     fieldName: string,
 ): Promise<string | null> {
+    // 先做白名单预检：这样 warning 能说清"是 MIME 不允许"而不是笼统的"无法解码"。
+    const declared = dataUrlMime(dataUrl);
+    if (declared !== null && !isAllowedAssetMime(declared)) {
+        stats.dropped += 1;
+        pushWarning(stats, `${fieldName} 处 data URL 的 MIME（${declared}）不在白名单，已置空`);
+        return null;
+    }
+
     const payload = decodeDataUrl(dataUrl);
     if (!payload) {
         stats.dropped += 1;

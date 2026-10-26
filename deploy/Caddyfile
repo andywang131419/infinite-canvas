@@ -23,6 +23,26 @@
 {$APP_DOMAIN:localhost} {
 	tls {$TLS_MODE:internal}
 
+	# -------------------------------------------------------------------------
+	# 0) 站点级安全响应头（QA P0-2 的纵深防御 / P2-14）
+	#
+	# 这一组的取值都是"恒定且安全"的，可以无条件覆盖上游：
+	#   -Server                    不暴露 Caddy 版本
+	#   X-Frame-Options DENY       禁止被任何页面 iframe（防点击劫持）
+	#   X-Content-Type-Options     禁止浏览器嗅探 Content-Type
+	#   Referrer-Policy no-referrer 跨站不泄漏 URL（URL 里带 storageKey）
+	#
+	# ⚠️ CSP 故意**不放**在这里：`header Content-Security-Policy ...` 是"覆盖"语义，
+	#    会把 /api/assets/raw 自己下发的 `default-src 'none'; sandbox`（更严格）
+	#    替换成站点级策略，反而削弱资产侧防护。CSP 见下方静态侧 handle 块。
+	# -------------------------------------------------------------------------
+	header {
+		-Server
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 
 	# -------------------------------------------------------------------------
@@ -56,6 +76,26 @@
 	# -------------------------------------------------------------------------
 	handle {
 		encode zstd gzip
+
+		# ---------------------------------------------------------------------
+		# CSP（只挂静态侧，原因见上方第 0 节的说明）
+		#
+		# 为什么 style-src 必须有 'unsafe-inline'：
+		#   AntD 6 的 CSS-in-JS 在**运行时**往 <head> 注入 <style> 标签，
+		#   去掉 'unsafe-inline' 会直接白屏（实测必需）。
+		# 为什么 script-src 也留了 'unsafe-inline'：
+		#   web/index.html 里有一段主题初始化内联脚本
+		#   （读 localStorage 决定 dark class），Vite 也可能注入 modulepreload 兜底脚本。
+		#   因此这条 CSP 不等于"零内联"——它挡住的是**外部脚本域**、object/embed 插件、
+		#   eval、以及被其他站点 iframe，这些才是"挂一个第三方脚本就全库泄露"的主要路径。
+		#   真正的存储型 XSS 由资产响应自身的 CSP（default-src 'none'; sandbox）
+		#   + 强制 attachment 收口，见 server/src/routes/assets.ts。
+		#
+		# 如需开启前端统计（ANALYTICS_GA4_ID / ANALYTICS_BAIDU_ID），
+		# 记得把 https://www.googletagmanager.com、https://hm.baidu.com 加进 script-src。
+		# ---------------------------------------------------------------------
+		header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
 		reverse_proxy web:3000
 	}
 }

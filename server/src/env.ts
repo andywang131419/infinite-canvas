@@ -100,7 +100,7 @@ const envSchema = z.object({
     /** 本地暂存目录（与 backup.sh 的 BACKUP_STAGE_DIR 保持一致）。 */
     BACKUP_STAGE_DIR: z.string().min(1).default("/data/backups"),
     /** 是否把媒体目录一并统计进审计行（tar 打包仍由 backup.sh 负责）。 */
-    BACKUP_INCLUDE_MEDIA: boolFromEnv(false),
+    BACKUP_INCLUDE_MEDIA: boolFromEnv(true),
     /** rclone 远端名；空 = 只留本地。 */
     RCLONE_REMOTE: z.string().default(""),
     /** rclone 目标路径（远端名之后的部分）。 */

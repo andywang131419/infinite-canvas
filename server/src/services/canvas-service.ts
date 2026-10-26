@@ -20,6 +20,7 @@
 import { z } from "zod";
 
 import {
+    countCanvasRows,
     findCanvasDetail,
     findCanvasRevision,
     insertCanvas,
@@ -207,6 +208,16 @@ export function getCanvasList(ownerId: string, limit = 100, offset = 0): CanvasS
 }
 
 /**
+ * 该用户的画布**总数**（不受分页影响）。
+ *
+ * 供列表接口的 `total` 使用：`total: items.length` 返回的是本页条数，
+ * 前端一旦按它做分页就永远只有一页（QA P2-1）。
+ */
+export function countCanvases(ownerId: string): number {
+    return countCanvasRows(ownerId);
+}
+
+/**
  * 详情：一次返回 `canvas` + `openJobs`（避免前端"打开画布"要发两个请求，
  * 弱网下能少一个 RTT）。
  *
@@ -220,7 +231,7 @@ export function getCanvasDetail(ownerId: string, canvasId: string): { canvas: Ca
         throw ApiError.notFound("画布不存在");
     }
 
-    const openJobs = listOpenJobs(id).map(toJobDto);
+    const openJobs = listOpenJobs(ownerId, id).map(toJobDto);
     const canvas = toDetailDto(row);
     canvas.openJobCount = openJobs.length;
 
@@ -254,7 +265,15 @@ export async function putCanvas(user: SessionUser, canvasId: string, body: unkno
     // ---- doc 清洗（T02 第 4 条）----
     // ingest 为 null 表示"存储不可用"：此时 data URL 会被丢弃而不是写库，
     // 保证「DB 里绝不出现 data:image」这条底线在任何情况下都成立。
-    const ingest = createDocIngest(user.id, id);
+    //
+    // ⚠️ 新建（baseRevision === 0）时**不能**把画布 id 绑给资产（QA P0-1）：
+    // 清洗发生在 `insertCanvas` 之前，而 `assets.canvas_id` 是**立即生效**的外键
+    // （`PRAGMA foreign_keys = ON`）。绑定一个尚不存在的画布 id 会让每一次
+    // `INSERT INTO assets` 都 `FOREIGN KEY constraint failed`，异常被 tryIngest 吞掉
+    // → 图被置空 + `dropped += 1`，但接口仍返回 201：**首次保存必丢图**。
+    // `assets.canvas_id` 允许 NULL，且它只是「按画布列举」的便利字段，
+    // 不是一致性依据，因此新建阶段直接不绑定。
+    const ingest = createDocIngest(user.id, input.baseRevision === 0 ? null : id);
     const { doc: cleaned, stats } = await sanitizeCanvasDoc(input.doc, ingest);
 
     // ---- 体积闸门（清洗之后量，因为提取 base64 会让 doc 显著变小）----
@@ -269,6 +288,8 @@ export async function putCanvas(user: SessionUser, canvasId: string, body: unkno
     }
 
     const title = resolveTitle(input.title, cleaned);
+    /** CAS 用标题：`null` 表示"本次请求没带标题，别动库里已有的名字"（QA P2-2）。 */
+    const casTitle = resolveTitleOrNull(input.title, cleaned);
     const nodeCount = resolveNodeCount(cleaned);
 
     // ---- 新建 ----
@@ -315,7 +336,7 @@ export async function putCanvas(user: SessionUser, canvasId: string, body: unkno
         baseRevision: input.baseRevision,
         doc: docJson,
         nodeCount,
-        title,
+        title: casTitle,
         deviceLabel: input.deviceLabel ?? null,
     });
 
@@ -325,7 +346,8 @@ export async function putCanvas(user: SessionUser, canvasId: string, body: unkno
     return {
         canvas: {
             id,
-            title,
+            // 没带标题时库里保留原名，响应也要如实回显原名（不能用 "未命名画布" 覆盖）。
+            title: summary?.title ?? title,
             revision: updated.revision,
             nodeCount,
             thumbnailAssetId: summary?.thumbnail_asset_id ?? null,
@@ -384,6 +406,21 @@ function revisionConflict(ownerId: string, canvasId: string, baseRevision: numbe
 function resolveTitle(explicit: string | undefined, doc: unknown): string {
     const fromDoc = readStringField(doc, "title");
     const candidate = explicit?.trim() || fromDoc?.trim() || "未命名画布";
+    return candidate.slice(0, 200);
+}
+
+/**
+ * 更新路径的标题推导：**没有可用的标题时返回 `null`**（QA P2-2）。
+ *
+ * 语义差别很关键：新建必须有一个标题（`canvases.title` 是 NOT NULL），
+ * 但更新时"请求没带 title、`doc.title` 也缺失"绝不意味着"把标题改成未命名画布"。
+ * 原先无条件 `title = ?` 会静默**覆盖用户已经起好的名字**。
+ * 返回 `null` 后由 SQL 的 `COALESCE(?, title)` 保留原值。
+ */
+function resolveTitleOrNull(explicit: string | undefined, doc: unknown): string | null {
+    const fromDoc = readStringField(doc, "title");
+    const candidate = explicit?.trim() || fromDoc?.trim();
+    if (!candidate) return null;
     return candidate.slice(0, 200);
 }
 
