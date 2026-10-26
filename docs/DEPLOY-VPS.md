@@ -278,7 +278,7 @@ $ grep -c '=$' .env
 | `BACKUP_ENABLED` | 🟧 | **只能写 `true`** | 🔴 写 `1` / `yes` / `on` / `True` → `entrypoint.sh:11` 只认精确的 `"true"`，会被判为"关闭备份" → **容器空转、一条备份都不做，而且没有任何报错**（详见附录 A F2）。在修复前请**写死 `true`** |
 | `BACKUP_INCLUDE_MEDIA` | 🟧 | `true` | 写 `false`/`0`/`no`/`off` → 只备份数据库，媒体零备份 → **恢复后画布里所有图 404**。另外不能写 `maybe` 这类无法判定的值，否则 server 启动崩溃 |
 | `RCLONE_REMOTE` + `RCLONE_DEST` | 🟧 | 远端名与目标路径，如 `mycos` / `ic-backup/2026` | 留空 = **只有 VPS 本地一份备份**。VPS 一毁全没。这是本项目最该补的一项 |
-| `RCLONE_CONFIG_FILE` | 🟩 | **保持默认**（`/root/.config/rclone/rclone.conf`） | 只有把 `rclone.conf` 放到别处才需要改（改法见 6.4）。注意：改了这个值**必须确认 compose 的 backup 服务已把它透传进容器**，否则容器里拿不到、仍然走默认路径 |
+| `RCLONE_CONFIG_FILE` | 🟩 | **留空**（compose 已透传；留空 = 默认 `/root/.config/rclone/rclone.conf`） | 只有把 `rclone.conf` 放到别处才需要填（改法见 6.4）。注意别设 `RCLONE_CONFIG`（单数）—— `backup.sh` 用 `--config` 显式传路径，flag 优先级高于环境变量，设了不生效 |
 | `BACKUP_ON_START` | 🟧 | —— | 🔴 **这个变量现在写了也没用**：只有 `entrypoint.sh:33` 读它，但 compose 和 `.env.example` 都没声明它 → 永远取默认 `false` → **首份备份要等到第二天凌晨 3 点**。首次上线请按 6.2 手动跑一次 |
 | `DATABASE_PATH` | 🟩 | **保持 `/data/app.db`** | 改了就必须同步改 backup 服务的 `DATABASE_PATH`，否则备份打的是空库 |
 | `STORAGE_LOCAL_ROOT` | 🟩 | **保持 `/data/media`** | 改了必须同步改 backup 服务的 `STORAGE_LOCAL_ROOT`，否则 `backup.sh` 找不到目录 → 记 failed 并退出 |
@@ -651,9 +651,11 @@ $ docker exec ic-backup rclone listremotes
 # 预期：输出你配的远端名，例如 mycos:
 ```
 
-想把配置文件放别处时：走的是 **`RCLONE_CONFIG_FILE`**（`backup.sh` 读的就是这个变量，改完要在 compose 的
-`backup.environment` 里透传）。
-注意别设 `RCLONE_CONFIG` —— `backup.sh` 用命令行 `--config` 显式传路径，flag 优先级高于同名环境变量，设了会被忽略。
+想把配置文件放别处时：改 **`RCLONE_CONFIG_FILE`**（`backup.sh` 读的就是这个变量）。
+compose 的 backup 服务已经透传了它（`746a0ef`），`.env` 里**留空即用默认** `/root/.config/rclone/rclone.conf`。
+
+注意别设 `RCLONE_CONFIG`（单数）—— 那是 rclone 自己的环境变量，但 `backup.sh:272` 用命令行 `--config`
+显式传了路径，rclone 的优先级是 **flag > 环境变量**，所以设了也不生效。
 
 在 `.env` 里填远端：
 
