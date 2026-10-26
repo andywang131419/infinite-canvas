@@ -13,6 +13,7 @@ import {
     isVideoJobType,
     jobErrorMessage,
     mapJobStatusToNodeStatus,
+    videoAspectRatioForJob,
 } from "../src/services/api/job-utils";
 
 describe("幂等键", () => {
@@ -102,6 +103,27 @@ describe("任务类型分派（阶段 2：audio / video 接队列）", () => {
         expect(isRecoverableJobType("video")).toBe(true);
         expect(isRecoverableJobType("llm")).toBe(false);
         expect(isRecoverableJobType(undefined)).toBe(false);
+    });
+});
+
+describe("视频参数", () => {
+    // 服务端 videoHandler 里 `ratio: readString(params, "ratio")` 是真在用的参数。
+    // 不传 = 服务端拿到空比例 = 出来的视频比例可能不对，用户能看见。
+    it("size → ratio：显式比例原样透传", () => {
+        expect(videoAspectRatioForJob("16:9")).toBe("16:9");
+        expect(videoAspectRatioForJob("9:16")).toBe("9:16");
+        expect(videoAspectRatioForJob("1:1")).toBe("1:1");
+    });
+
+    it("auto / 空值必须落成 16:9，绝不能返回 auto 或空串", () => {
+        expect(videoAspectRatioForJob("auto")).toBe("16:9");
+        expect(videoAspectRatioForJob("")).toBe("16:9");
+        expect(videoAspectRatioForJob(undefined)).toBe("16:9");
+    });
+
+    it("像素尺寸折算成最接近的比例", () => {
+        expect(videoAspectRatioForJob("1920x1080")).toBe("16:9");
+        expect(videoAspectRatioForJob("1080x1920")).toBe("9:16");
     });
 });
 

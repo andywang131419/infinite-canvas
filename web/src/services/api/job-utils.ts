@@ -9,6 +9,8 @@
  * 抽出来之后它们可以被 `bun test` 真实执行。
  */
 
+import { inferVideoRatio } from "@/lib/media-size";
+
 /** 服务端 job 状态（与 `jobs` 表的 CHECK 约束一致）。 */
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "canceled";
 
@@ -135,6 +137,22 @@ export function firstStorageKeyWithPrefix(keys: readonly string[] | null | undef
         if (typeof key === "string" && key.startsWith(prefix)) return key;
     }
     return null;
+}
+
+/**
+ * `size`（"16:9" / "1920x1080" / "auto" …）→ 视频任务要的 `ratio`。
+ *
+ * **这个参数必须传**：服务端 `jobs/handlers/video.ts` 里
+ * `ratio: readString(params, "ratio")` 是真在用、不是摆设。不传的话服务端拿到空
+ * ratio，出来的视频比例可能不对 —— 这是**用户能看见**的质量问题。
+ *
+ * 与浏览器直连路径里 `services/api/video.ts` 的私有 `videoAspectRatio()` 等价，
+ * 但刻意放在这里：它是"给任务拼参数"的纯逻辑、可单测，也不依赖 `video.ts`
+ * 那个模块将来还在不在（`video.ts` 已列入清理候选，函数留在里面会被一起删掉）。
+ */
+export function videoAspectRatioForJob(size: string | null | undefined): string {
+    const ratio = inferVideoRatio(size ?? "");
+    return ratio === "auto" ? "16:9" : ratio;
 }
 
 /**

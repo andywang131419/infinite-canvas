@@ -176,7 +176,37 @@ Caddy 会忽略客户端自带的 `X-Forwarded-*` 并写入真实 IP。但将来
 
 ---
 
-## 11. 其它小项
+## 11. 视频生成转队列后，参考视频 / 参考音频参数无处可传
+
+**位置**
+- 前端：`web/src/pages/canvas/project.tsx` 的 `runVideoJobForNode`（T04-B 阶段 2）
+- 服务端：`server/src/jobs/handlers/video.ts` 的 `videoHandler`
+
+**现象**
+浏览器直连路径 `createVideoGenerationTask(config, prompt, images, { signal, videos, audios })`
+支持传参考视频（`options.videos`）和参考音频（`options.audios`），
+但服务端 `videoHandler` 的 params **只认 `references`（图片 storageKey）**，
+没有 `videos` / `audios` 两个字段。视频生成改走服务端队列后，
+这两个参数在提交时没有落点，本轮按"不传"实现。
+
+**影响面有限**：浏览器侧真正消费 `videos` / `audios` 的只有 **plugin 分支**
+（`services/api/video.ts` 的 `createPluginVideoTask`），openai / gemini 分支本来就不用。
+
+**为什么本轮不修**
+补它要同时动服务端 handler 与 provider（新增参数解析、落盘、传给上游），
+是独立工作量；T04-B 本轮的目标是"接队列 + 刷新可恢复"，不是补齐上游能力。
+
+**将来修的时候必须注意**
+1. 服务端 `videoHandler` 增加 `videos` / `audios` 参数，同样只接受 **storageKey** ——
+   不能是 `data:` 内联，`job-service.ts` 的 `normalizeParams` 会直接拒；
+2. 前端 `runVideoJobForNode` 里把 `generationContext.referenceVideos/referenceAudios`
+   先落库成 storageKey 再传过去，与图片参考图共用 `resolveReferenceStorageKeys`；
+3. **别只改前端**：服务端不认识的 params 键会被静默忽略，只改前端等于参数继续丢失，
+   而且没有任何报错。
+
+---
+
+## 12. 其它小项
 
 | 项 | 位置 | 说明 | 将来怎么办 |
 | --- | --- | --- | --- |

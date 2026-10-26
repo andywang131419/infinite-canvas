@@ -19,6 +19,7 @@ import {
     isRecoverableJobType,
     isVideoJobType,
     jobErrorMessage,
+    videoAspectRatioForJob,
 } from "@/services/api/job-utils";
 import { cancelJob, createJob, listOpenJobs, waitForJob, type JobDto } from "@/services/api/jobs";
 import { describeStoredFile, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
@@ -533,6 +534,8 @@ function InfiniteCanvasPage() {
                         seconds: Number(config.videoSeconds) || 8,
                         size: config.size,
                         resolution: config.vquality,
+                        // 服务端 videoHandler 真在用这个参数，不传会拿到空比例。
+                        ratio: videoAspectRatioForJob(config.size),
                         generateAudio: boolConfig(config.videoGenerateAudio, true),
                         watermark: boolConfig(config.videoWatermark, false),
                     },
