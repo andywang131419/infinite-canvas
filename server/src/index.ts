@@ -16,11 +16,16 @@ import { checkDbHealth, closeDb, getDb, getMigrationInfo } from "./db/client";
 import { purgeSessions } from "./db/repos/sessions";
 import { EnvValidationError, getEnv, type Env } from "./env";
 import { handleError, handleNotFound } from "./http/respond";
+import { registerAllHandlers } from "./jobs/handlers/index";
 import { startWorker, stopWorker } from "./jobs/worker";
 import { assetRoutes } from "./routes/assets";
 import { authRoutes } from "./routes/auth";
+import { backupRoutes } from "./routes/backups";
 import { canvasRoutes } from "./routes/canvases";
+import { channelRoutes } from "./routes/channels";
 import { healthRoutes } from "./routes/health";
+import { jobRoutes } from "./routes/jobs";
+import { proxyRoutes } from "./routes/proxy";
 import { setupRoutes } from "./routes/setup";
 
 /** 构建 Hono 应用（不含副作用，便于测试直接 import）。 */
@@ -31,12 +36,16 @@ export function createApp(): Hono {
     app.notFound(handleNotFound);
 
     /**
-     * 路由挂载顺序（T02 起）：
+     * 路由挂载顺序（T03 起）：
      * - `/api/health*`    —— 不需鉴权（compose healthcheck 用）
      * - `/api/setup*`     —— 不需鉴权，但**仅 users 表为空时**才真正生效
      * - `/api/auth/*`     —— login 不需鉴权；logout / me 自行判断会话
      * - `/api/canvases/*` —— 全部 requireAuth
      * - `/api/assets/*`   —— 全部 requireAuth
+     * - `/api/channels/*` —— 全部 requireAuth（owner 才能写）
+     * - `/api/jobs*`      —— 全部 requireAuth
+     * - `/api/proxy`      —— 全部 requireAuth + 白名单 + SSRF 防护
+     * - `/api/backups*`   —— 全部 requireAuth（owner 才能手动触发）
      *
      * 注意：**没有**全局鉴权中间件。每个受保护路由自己挂 `requireAuth`，
      * 这样 grep 一次就能审计出全部受保护端点（见 auth/middleware.ts 注释）。
@@ -46,6 +55,10 @@ export function createApp(): Hono {
     app.route("/api", authRoutes);
     app.route("/api", canvasRoutes);
     app.route("/api", assetRoutes);
+    app.route("/api", channelRoutes);
+    app.route("/api", jobRoutes);
+    app.route("/api", proxyRoutes);
+    app.route("/api", backupRoutes);
 
     return app;
 }
@@ -87,6 +100,9 @@ async function main(): Promise<void> {
     if (purged > 0) console.info(`[boot] 清理过期会话 ${purged} 条`);
 
     // ---- 3. Worker ----
+    // 注册 handler 必须在 startWorker 之前：Worker 只认已注册的类型，
+    // 注册晚了会有"第一个 tick 找不到 handler"的窗口（任务被判 INTERNAL 失败）。
+    registerAllHandlers();
     startWorker();
 
     // ---- 4. HTTP ----

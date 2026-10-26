@@ -89,12 +89,22 @@ const envSchema = z.object({
                 .filter(Boolean),
         ),
 
-    // ===== 备份（仅用于 /api/health 展示，实际执行在 backup 容器）=====
+    // ===== 备份 =====
+    // cron 侧的实际执行在 backup 容器（deploy/backup/backup.sh）；
+    // 服务端只负责「手动触发一次」（POST /api/backups/run）与审计行读写的展示。
     BACKUP_ENABLED: boolFromEnv(true),
     BACKUP_CRON: z.string().min(1).default("0 3 * * *"),
     BACKUP_DB_KEEP_DAYS: intFromEnv(14),
     BACKUP_RETRY: intFromEnv(3),
     BACKUP_TARGET_LABEL: z.string().default(""),
+    /** 本地暂存目录（与 backup.sh 的 BACKUP_STAGE_DIR 保持一致）。 */
+    BACKUP_STAGE_DIR: z.string().min(1).default("/data/backups"),
+    /** 是否把媒体目录一并统计进审计行（tar 打包仍由 backup.sh 负责）。 */
+    BACKUP_INCLUDE_MEDIA: boolFromEnv(false),
+    /** rclone 远端名；空 = 只留本地。 */
+    RCLONE_REMOTE: z.string().default(""),
+    /** rclone 目标路径（远端名之后的部分）。 */
+    RCLONE_DEST: z.string().default(""),
 });
 
 /** 校验后的环境变量类型。 */

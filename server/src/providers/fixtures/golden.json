@@ -1,0 +1,242 @@
+{
+    "_comment": "T03 Provider 适配器的 golden fixture。每个用例由 verify-t03.mjs 用固定入参构建请求/解析响应后逐一断言。数值来源：web/src/services/api/{image,audio,model-plugin}.ts 的实际请求构造。",
+    "openai": {
+        "imageGeneration": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "gpt-image-1" },
+            "params": { "prompt": "一只猫", "count": 2, "size": "1024x1024", "quality": "high", "background": "transparent" },
+            "expect": {
+                "url": "https://api.example.com/v1/images/generations",
+                "method": "POST",
+                "body": {
+                    "model": "gpt-image-1",
+                    "prompt": "一只猫",
+                    "n": 2,
+                    "quality": "high",
+                    "size": "1024x1024",
+                    "background": "transparent",
+                    "output_format": "png"
+                }
+            }
+        },
+        "imageGenerationWithResponseFormat": {
+            "ctx": { "baseUrl": "https://api.example.com/v1", "model": "flux-dev" },
+            "params": { "prompt": "一只猫", "count": 1 },
+            "expect": {
+                "url": "https://api.example.com/v1/images/generations",
+                "body": {
+                    "model": "flux-dev",
+                    "prompt": "一只猫",
+                    "n": 1,
+                    "response_format": "b64_json",
+                    "output_format": "png"
+                }
+            }
+        },
+        "imageEditFields": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "gpt-image-1" },
+            "params": { "prompt": "改成水彩", "count": 1, "quality": "low" },
+            "expect": {
+                "url": "https://api.example.com/v1/images/edits",
+                "fields": {
+                    "model": "gpt-image-1",
+                    "prompt": "改成水彩",
+                    "n": "1",
+                    "output_format": "png",
+                    "quality": "low"
+                },
+                "imageField": "image"
+            }
+        },
+        "imageResponse": {
+            "payload": { "created": 1700000000, "data": [{ "b64_json": "AQID" }] },
+            "expect": [{ "kind": "base64", "data": "AQID" }]
+        },
+        "imageResponseWithUrl": {
+            "payload": { "images": [{ "url": "https://cdn.example.com/a.png" }] },
+            "expect": [{ "kind": "url", "url": "https://cdn.example.com/a.png" }]
+        },
+        "audioSpeech": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "tts-1" },
+            "params": { "prompt": "你好", "voice": "alloy", "format": "mp3", "speed": 1.25 },
+            "expect": {
+                "url": "https://api.example.com/v1/audio/speech",
+                "body": {
+                    "model": "tts-1",
+                    "input": "你好",
+                    "response_format": "mp3",
+                    "voice": "alloy",
+                    "speed": 1.25
+                }
+            }
+        },
+        "responses": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "gpt-5" },
+            "params": {
+                "messages": [
+                    { "role": "system", "content": "你是助手" },
+                    { "role": "user", "content": "你好" }
+                ],
+                "reasoningEffort": "high"
+            },
+            "expect": {
+                "url": "https://api.example.com/v1/responses",
+                "body": {
+                    "model": "gpt-5",
+                    "input": [
+                        { "role": "system", "content": "你是助手" },
+                        { "role": "user", "content": "你好" }
+                    ],
+                    "reasoning": { "effort": "high" }
+                }
+            }
+        },
+        "responsesNoReasoning": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "gpt-5" },
+            "params": { "messages": [{ "role": "user", "content": "hi" }], "reasoningEffort": "auto" },
+            "expect": {
+                "url": "https://api.example.com/v1/responses",
+                "body": { "model": "gpt-5", "input": [{ "role": "user", "content": "hi" }] }
+            }
+        },
+        "videoCreateFields": {
+            "ctx": { "baseUrl": "https://api.example.com", "model": "sora-2" },
+            "params": { "prompt": "海边日落", "seconds": 8, "size": "1280x720", "resolution": "720p", "generateAudio": true, "watermark": false, "mode": "frames" },
+            "expect": {
+                "url": "https://api.example.com/v1/videos",
+                "fields": {
+                    "model": "sora-2",
+                    "prompt": "海边日落",
+                    "seconds": "8",
+                    "size": "1280x720",
+                    "resolution_name": "720p",
+                    "generate_audio": "true",
+                    "watermark": "false",
+                    "mode": "frames"
+                }
+            }
+        },
+        "videoStatusCompletedWithUrl": {
+            "payload": { "id": "video_1", "status": "completed", "video_url": "https://cdn.example.com/v.mp4" },
+            "expect": { "state": "succeeded", "url": "https://cdn.example.com/v.mp4", "needsContent": false }
+        },
+        "videoStatusCompletedWithoutUrl": {
+            "payload": { "id": "video_2", "status": "completed" },
+            "expect": { "state": "succeeded", "url": null, "needsContent": true }
+        },
+        "videoStatusFailed": {
+            "payload": { "id": "video_3", "status": "failed", "error": { "message": "内容不合规" } },
+            "expect": { "state": "failed", "message": "内容不合规" }
+        },
+        "responsesTextPlain": {
+            "payload": { "output_text": "hello" },
+            "expect": "hello"
+        },
+        "responsesTextStructured": {
+            "payload": { "output": [{ "type": "message", "content": [{ "type": "output_text", "text": "ab" }, { "text": "cd" }] }] },
+            "expect": "abcd"
+        }
+    },
+    "gemini": {
+        "image": {
+            "ctx": { "baseUrl": "https://generativelanguage.googleapis.com", "model": "models/gemini-2.5-flash-image" },
+            "params": { "prompt": "一只猫", "size": "1024x1024" },
+            "expect": {
+                "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+                "body": {
+                    "generationConfig": {
+                        "responseModalities": ["TEXT", "IMAGE"],
+                        "imageConfig": { "aspectRatio": "1:1", "imageSize": "1K" }
+                    },
+                    "contents": [{ "role": "user", "parts": [{ "text": "一只猫" }] }]
+                }
+            }
+        },
+        "video": {
+            "ctx": { "baseUrl": "https://generativelanguage.googleapis.com", "model": "veo-3" },
+            "params": { "prompt": "海边日落", "mode": "frames", "seconds": 8, "size": "1280x720", "resolution": "720p", "generateAudio": true, "watermark": false, "referenceBytes": [1, 2, 3] },
+            "expect": {
+                "url": "https://generativelanguage.googleapis.com/v1beta/models/veo-3:predictLongRunning",
+                "body": {
+                    "instances": [
+                        {
+                            "prompt": "海边日落",
+                            "image": { "inlineData": { "mimeType": "image/png", "data": "AQID" } }
+                        }
+                    ],
+                    "parameters": {
+                        "aspectRatio": "16:9",
+                        "durationSeconds": 8,
+                        "resolution": "720p",
+                        "generateAudio": true,
+                        "addWatermark": false
+                    }
+                }
+            }
+        },
+        "text": {
+            "ctx": { "baseUrl": "https://generativelanguage.googleapis.com", "model": "gemini-2.5-pro" },
+            "params": {
+                "messages": [
+                    { "role": "system", "content": "你是助手" },
+                    { "role": "user", "content": "你好" }
+                ]
+            },
+            "expect": {
+                "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+                "body": {
+                    "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }],
+                    "systemInstruction": { "parts": [{ "text": "你是助手" }] }
+                }
+            }
+        },
+        "imageResponse": {
+            "payload": {
+                "candidates": [
+                    { "content": { "parts": [{ "inlineData": { "mimeType": "image/png", "data": "AQID" } }, { "text": "done" }] } }
+                ]
+            },
+            "expect": [{ "kind": "bytes", "mime": "image/png", "base64": "AQID" }]
+        },
+        "imageResponseSnakeCase": {
+            "payload": {
+                "candidates": [
+                    { "content": { "parts": [{ "inline_data": { "mime_type": "image/jpeg", "data": "AQID" } }] } }
+                ]
+            },
+            "expect": [{ "kind": "bytes", "mime": "image/jpeg", "base64": "AQID" }]
+        },
+        "operationDone": {
+            "payload": {
+                "name": "models/veo-3/operations/abc",
+                "done": true,
+                "response": { "generateVideoResponse": { "generatedSamples": [{ "video": { "uri": "https://generativelanguage.googleapis.com/v1/files/x:download" } }] } }
+            },
+            "expect": { "state": "succeeded", "videoUri": "https://generativelanguage.googleapis.com/v1/files/x:download" }
+        },
+        "operationPending": {
+            "payload": { "name": "models/veo-3/operations/abc", "done": false },
+            "expect": { "state": "pending" }
+        },
+        "operationFailed": {
+            "payload": { "name": "models/veo-3/operations/abc", "error": { "message": "quota exceeded" } },
+            "expect": { "state": "failed", "message": "quota exceeded" }
+        },
+        "textResponse": {
+            "payload": { "candidates": [{ "content": { "parts": [{ "text": "ab" }, { "text": "cd" }] } }] },
+            "expect": "abcd"
+        },
+        "blockedResponse": {
+            "payload": { "promptFeedback": { "blockReason": "SAFETY" } },
+            "expectError": { "code": "PROVIDER_CONTENT_REJECTED" }
+        }
+    },
+    "statusMapping": [
+        { "status": 429, "code": "QUOTA_EXCEEDED", "retryable": true },
+        { "status": 500, "code": "PROVIDER_UPSTREAM_ERROR", "retryable": true },
+        { "status": 401, "code": "PROVIDER_UPSTREAM_ERROR", "retryable": false },
+        { "status": 404, "code": "PROVIDER_UPSTREAM_ERROR", "retryable": false },
+        { "status": 400, "code": "PROVIDER_UPSTREAM_ERROR", "retryable": false, "message": "invalid size" },
+        { "status": 400, "code": "PROVIDER_CONTENT_REJECTED", "retryable": false, "message": "Your request was rejected by the content policy" },
+        { "status": 422, "code": "PROVIDER_CONTENT_REJECTED", "retryable": false, "message": "moderation flagged" }
+    ]
+}

@@ -14,15 +14,14 @@
         "test": "bun test",
         "typecheck": "tsc --noEmit",
         "user:create": "bun run scripts/create-user.ts",
-        "verify:t02": "node scripts/verify-t02.mjs"
+        "verify:t02": "node scripts/verify-t02.mjs",
+        "verify:t03": "node scripts/verify-t03.mjs"
     },
     "dependencies": {
         "hono": "^4.6.14",
-        "drizzle-orm": "^0.38.2",
         "zod": "^3.24.1"
     },
     "devDependencies": {
-        "drizzle-kit": "^0.30.1",
         "@types/bun": "^1.1.14",
         "typescript": "^5.7.2"
     }

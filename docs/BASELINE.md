@@ -194,9 +194,7 @@ RUN bun install --production --frozen-lockfile
 
 ---
 
-## 7. T02 的替代验证方式（无 Bun / 无 Docker 时怎么保证质量）
-
-`server/scripts/verify-t02.mjs` 只用 **Node 22 自带能力**跑真断言，覆盖：
+## 7. T02 的替代验证方式（无 Bun / 无 Docker 时怎么保证质量）`server/scripts/verify-t02.mjs` 只用 **Node 22 自带能力**跑真断言，覆盖：
 
 | 覆盖点 | 手段 |
 |---|---|
@@ -212,3 +210,13 @@ RUN bun install --production --frozen-lockfile
 **它不能替代**的部分（必须在有 Bun 的机器上补跑）：
 `bun install` / `bun run typecheck` / `bun test` / 服务真实启动 + `curl` 登录画布全链路 /
 `docker compose build`。
+
+---
+
+## 8. 与 ARCH 的偏差
+
+| # | 偏差 | 原因 | 影响面 |
+|---|---|---|---|
+| 1 | **数据层采用 `bun:sqlite` + 原生 SQL + 自建 `schema_migrations` 迁移器，未使用 Drizzle；`drizzle-orm` / `drizzle-kit` 依赖已移除。** | ① R2.1 要求镜像内不出现 `python3`/`make`/`g++`，ORM 的 CLI/迁移器会引入额外构建面；② 本项目只有 9 张表、查询简单，原生 SQL 更透明；③ 乐观锁那条 CAS UPDATE 必须能"整条"被审计与单测，ORM 的表达式构造反而会把它隐藏起来；④ 自建迁移器（`server/src/db/client.ts`）按 `schema_migrations.version` + SHA-256 校验和去重，已满足幂等要求。 | `server/package.json` 依赖从 5 个降到 3 个（hono / zod / @types/bun）。迁移文件仍是纯 `.sql`，未来若引入别的查询层不影响 schema。 |
+| 2 | T01 遗留：`server/Dockerfile` 仍是 `bun install --production`，**未**加 `--frozen-lockfile` | 开发机没有 Bun，无法生成 `server/bun.lock`（见第 6 节） | 镜像构建暂不可复现，属已知缺口 |
+| 3 | 存储键与物理路径解耦：`storage_key`（`image:{nanoid}`）**不参与**文件路径拼接，物理路径由 `sha256 + mime + created_at` 推导为 `media/{yyyy}/{mm}/{sha256}.{ext}` | `0001_init.sql` 的注释原本写的是 `media/{kind}/{nanoid前2位}/{nanoid}`。改成内容寻址后：① 路径穿越在构造上不可能；② 同内容天然去重（与 `ux_assets_sha256_driver` 一致）。**未修改 0001_init.sql**（改注释会变更 checksum，导致已执行过迁移的库校验失败） | 仅注释与实现不一致，schema 无需变更 |
