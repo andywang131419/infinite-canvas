@@ -5,7 +5,10 @@ import { Group, Video } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
-import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
+// 只保留 `requestImageQuestion`：文本分支是流式的，不走队列（见阶段 2 结论）。
+// `requestEdit` / `requestGeneration` 在画布页已无调用点 —— 图像生成统一走
+// `runImageJobForNode`，继续留着这两个 import 会让人以为浏览器直连还活着。
+import { requestImageQuestion } from "@/services/api/image";
 import { boolConfig, defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { describeStoredImage, ensureImagePreview, uploadImage } from "@/services/image-storage";
 import {
@@ -465,8 +468,25 @@ function InfiniteCanvasPage() {
                         const storageKey = firstImageStorageKey(finished.resultStorageKeys);
                         if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
                         const imageId = pickImageIdForJob(job, nodes);
-                        if (!imageId) throw new Error(t("canvas.projectPage.generationFailed"));
                         const described = await describeStoredImage(storageKey, { signal });
+                        // 次级入口（局部重绘 / 多角度 / 内置面板写回 / 重试）的结果落在
+                        // **节点本身**，节点上压根没有 `images[]`。这类任务刷新后如果不
+                        // 单独处理，会因为"找不到 imageId"被错标成失败 —— 服务端其实
+                        // 已经生成好了，钱也花了，用户只看到红字。
+                        if (!imageId) {
+                            setNodes((prev) =>
+                                prev.map((item) =>
+                                    item.id === job.nodeId
+                                        ? {
+                                              ...item,
+                                              ...fitNodeSize(described.width, described.height, item.width, item.height),
+                                              metadata: { ...item.metadata, ...imageMetadata(described), jobId: job.id, status: NODE_STATUS_SUCCESS, errorDetails: undefined },
+                                          }
+                                        : item,
+                                ),
+                            );
+                            return;
+                        }
                         applyImageItem(job.nodeId, imageId, {
                             id: imageId,
                             jobId: job.id,
@@ -550,6 +570,49 @@ function InfiniteCanvasPage() {
             if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
             const video = await describeStoredFile(storageKey, "video/mp4");
             setNodes((prev) => prev.map((item) => (item.id === nodeId ? applyGeneratedVideo(item, video, { prompt, model: config.model, ...extra }) : item)));
+        },
+        [projectId, resolveReferenceStorageKeys, t],
+    );
+
+    /**
+     * 图像生成（单张）走服务端队列，返回已落盘的结果（T04-B 阶段 3）。
+     *
+     * 给**次级入口**用（局部重绘 / 多角度 / 内置面板写回）：它们和主流程的区别只是
+     * "写了什么 prompt、带几张参考图、结果落到节点哪个字段"，提交与轮询这一段完全一样。
+     * 写回交给调用方 —— 每个入口的落点不同（有的是 `metadata.content`，
+     * 有的是 `images[]` 里的某一张），在这里统一写会写错地方。
+     *
+     * @returns 已上传好的图片（url / storageKey / 宽高 / 字节 / mime）
+     */
+    const runImageJobForNode = useCallback(
+        async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, references: ReferenceImage[], jobKey: string, signal: AbortSignal) => {
+            const referenceStorageKeys = await resolveReferenceStorageKeys(references, signal);
+            const { job } = await createJob(
+                {
+                    canvasId: projectId,
+                    nodeId,
+                    // 有参考图就是编辑，没有就是纯生成 —— 服务端 `imageEditHandler`
+                    // 会校验 references 非空，这里必须和服务端的判断保持一致。
+                    type: referenceStorageKeys.length ? "image_edit" : "image",
+                    model: config.model,
+                    params: {
+                        prompt,
+                        references: referenceStorageKeys,
+                        count: 1,
+                        size: config.size,
+                        quality: config.quality,
+                        background: config.background,
+                    },
+                    idempotencyKey: buildImageJobIdempotencyKey(nodeId, jobKey),
+                },
+                signal,
+            );
+            setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, jobId: job.id, jobKey } } : item)));
+            const finished = await waitForJob(job.id, { signal });
+            if (finished.status !== "succeeded") throw new Error(jobErrorMessage(finished) || t("canvas.projectPage.generationFailed"));
+            const storageKey = firstImageStorageKey(finished.resultStorageKeys);
+            if (!storageKey) throw new Error(t("canvas.projectPage.generationFailed"));
+            return describeStoredImage(storageKey, { signal });
         },
         [projectId, resolveReferenceStorageKeys, t],
     );
@@ -2228,7 +2291,8 @@ function InfiniteCanvasPage() {
             const maskSource = { id: maskNodeId, name: "mask.png", type: maskImage.mimeType || "image/png", dataUrl: maskImage.url, storageKey: maskImage.storageKey };
             const references = [source, maskSource];
             const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, references);
-            const childMetadata = payload.generate ? { prompt, status: NODE_STATUS_LOADING, ...generationMetadata } : { prompt };
+            const maskEditJobKey = nanoid();
+            const childMetadata = payload.generate ? { prompt, status: NODE_STATUS_LOADING, jobKey: maskEditJobKey, ...generationMetadata } : { prompt };
             setNodes((prev) => [
                 ...prev,
                 {
@@ -2262,10 +2326,9 @@ function InfiniteCanvasPage() {
             setRunningNodeId(childId);
             const controller = startGenerationRequest(childId, node.id, childId);
             try {
-                const image = await requestEdit(generationConfig, prompt, references, { signal: controller.signal }).then((items) => items[0]);
-                const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
-                const size = fitNodeSize(uploaded.width, uploaded.height, node.width, node.height);
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
+                const image = await runImageJobForNode(childId, generationConfig, prompt, references, maskEditJobKey, controller.signal);
+                const size = fitNodeSize(image.width, image.height, node.width, node.height);
+                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(image), prompt, ...generationMetadata } } : item)));
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.maskFailed");
@@ -2276,7 +2339,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
     );
 
     const upscaleImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageUpscaleParams) => {
@@ -2313,12 +2376,12 @@ function InfiniteCanvasPage() {
                 return;
             }
             const childId = nanoid();
+            const angleJobKey = nanoid();
             const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
             const title = buildAngleLabel(params);
             const prompt = buildAnglePrompt(params);
-            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [
-                { id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey },
-            ]);
+            const angleReference = { id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey };
+            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [angleReference]);
             setAngleNodeId(null);
             setRunningNodeId(childId);
             setNodes((prev) => [
@@ -2330,7 +2393,7 @@ function InfiniteCanvasPage() {
                     position: { x: node.position.x + node.width + 96, y: node.position.y },
                     width: imageConfig.width,
                     height: imageConfig.height,
-                    metadata: { prompt, status: NODE_STATUS_LOADING, ...generationMetadata },
+                    metadata: { prompt, status: NODE_STATUS_LOADING, jobKey: angleJobKey, ...generationMetadata },
                 },
             ]);
             setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
@@ -2338,15 +2401,11 @@ function InfiniteCanvasPage() {
             setDialogNodeId(childId);
             const controller = startGenerationRequest(childId, node.id, childId);
             try {
-                const image = await requestEdit(
-                    generationConfig,
-                    prompt,
-                    [{ id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey }],
-                    { signal: controller.signal },
-                ).then((items) => items[0]);
-                const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
-                const size = fitNodeSize(uploaded.width, uploaded.height, imageConfig.width, imageConfig.height);
-                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(uploaded), prompt, ...generationMetadata } } : item)));
+                // 多角度本质是一次 `image_edit`：拿原图当参考图，只是 prompt 换成了
+                // "换个机位重画一遍"。所以走和主流程同一条队列路径。
+                const image = await runImageJobForNode(childId, generationConfig, prompt, [angleReference], angleJobKey, controller.signal);
+                const size = fitNodeSize(image.width, image.height, imageConfig.width, imageConfig.height);
+                setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, width: size.width, height: size.height, metadata: { ...item.metadata, ...imageMetadata(image), prompt, ...generationMetadata } } : item)));
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
@@ -2356,7 +2415,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -2559,17 +2618,17 @@ function InfiniteCanvasPage() {
                 if (!scene) return;
                 setRunningNodeId(nodeId);
                 const controller = startGenerationRequest(nodeId, nodeId, nodeId);
-                setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, prompt: scene, status: NODE_STATUS_LOADING, errorDetails: undefined } } : node)));
+                // 内置面板写回：结果落在**自己**这个节点上，不是子节点。jobKey 每次动作一个新值，
+                // 否则 `enqueueJob` 的幂等（键存在就返回已有任务、不看终态）会让重复生成拿到旧图。
+                const builtinJobKey = nanoid();
+                setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, prompt: scene, jobKey: builtinJobKey, status: NODE_STATUS_LOADING, errorDetails: undefined } } : node)));
                 try {
                     const fullPrompt = (builtinPanel.promptPrefix || "") + scene;
                     const context = await hydrateNodeGenerationContext(buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, fullPrompt));
                     const refs = context.referenceImages;
-                    const image = refs.length
-                        ? await requestEdit({ ...generationConfig, count: "1" }, context.prompt, refs, { signal: controller.signal }).then((items) => items[0])
-                        : await requestGeneration({ ...generationConfig, count: "1" }, context.prompt, { signal: controller.signal }).then((items) => items[0]);
-                    const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
+                    const image = await runImageJobForNode(nodeId, generationConfig, context.prompt, refs, builtinJobKey, controller.signal);
                     setNodes((prev) =>
-                        prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, ...imageMetadata(uploaded), prompt: scene, model: generationConfig.model, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)),
+                        prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, ...imageMetadata(image), prompt: scene, model: generationConfig.model, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)),
                     );
                     setDialogNodeId(null);
                 } catch (error) {
@@ -2995,7 +3054,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [applyImageItem, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, runAudioJobForNode, runVideoJobForNode, startGenerationRequest, t],
+        [applyImageItem, effectiveConfig, finishGenerationRequest, isAiConfigReady, markImageError, message, openConfigDialog, projectId, resolveReferenceStorageKeys, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -3077,10 +3136,9 @@ function InfiniteCanvasPage() {
                     return;
                 }
 
-                const image = useReferenceImages
-                    ? await requestEdit(generationConfig, prompt, retryImages, { signal: controller.signal }).then((items) => items[0])
-                    : await requestGeneration(generationConfig, prompt, { signal: controller.signal }).then((items) => items[0]);
-                const uploadedImage = await uploadImage(image.dataUrl, { signal: controller.signal });
+                // 重试是一次**新的**生成动作：换新 jobKey，否则幂等键命中上一次那个
+                // 已失败的 job，界面转一圈出来还是同一条错误。
+                const uploadedImage = await runImageJobForNode(node.id, generationConfig, prompt, retryImages, nanoid(), controller.signal);
                 const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
                 const retryImage: CanvasNodeImage = {
                     id: imageId || node.metadata?.primaryImageId || nanoid(),
@@ -3148,7 +3206,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runAudioJobForNode, runVideoJobForNode, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runAudioJobForNode, runImageJobForNode, runVideoJobForNode, startGenerationRequest, t],
     );
 
     const deleteBatchImage = useCallback((nodeId: string, imageId: string) => {
