@@ -2458,10 +2458,12 @@ function InfiniteCanvasPage() {
                 setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
             } finally {
                 finishGenerationRequest(childId, controller);
-                setRunningNodeId(null);
+                // 无条件清会把**别的节点**的停止按钮一起收走：原节点 A 还在生成时
+                // 生成的 mask 子节点 B 先结束，按钮一清，A 就点不了停止了。
+                clearRunningNodeIdIfIdle(childId);
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
+        [clearRunningNodeIdIfIdle, effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
     );
 
     const upscaleImageNode = useCallback(async (node: CanvasNodeData, params: CanvasImageUpscaleParams) => {
@@ -2534,10 +2536,11 @@ function InfiniteCanvasPage() {
                 setNodes((prev) => prev.map((item) => (item.id === childId ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_ERROR, errorDetails } } : item)));
             } finally {
                 finishGenerationRequest(childId, controller);
-                setRunningNodeId(null);
+                // 同局部重绘：原节点可能还在生成，无条件清会把它的停止按钮一起收走。
+                clearRunningNodeIdIfIdle(childId);
             }
         },
-        [effectiveConfig, finishGenerationRequest, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
+        [clearRunningNodeIdIfIdle, effectiveConfig, finishGenerationRequest, openConfigDialog, runImageJobForNode, startGenerationRequest, t],
     );
 
     const handleFontSizeChange = useCallback((nodeId: string, fontSize: number) => {
@@ -2776,13 +2779,13 @@ function InfiniteCanvasPage() {
             const effectivePrompt = generationContext.prompt.trim();
             if (runController.signal.aborted) {
                 finishGenerationRequest(nodeId, runController);
-                setRunningNodeId(null);
+                clearRunningNodeIdIfIdle(nodeId);
                 return;
             }
             const markSourceStatus = sourceNode?.type !== CanvasNodeType.Image && !editingTextNode;
             if (!effectivePrompt && (mode === "text" || mode === "audio")) {
                 finishGenerationRequest(nodeId, runController);
-                setRunningNodeId(null);
+                clearRunningNodeIdIfIdle(nodeId);
                 return;
             }
             let pendingChildIds: string[] = [];
@@ -3330,7 +3333,11 @@ function InfiniteCanvasPage() {
                                       ...item.metadata,
                                       status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
                                       errorDetails: item.metadata?.content ? undefined : errorDetails,
-                                      images: item.metadata?.images?.map((image) => (image.id === imageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)),
+                                      // 必须用 `retryImageId` 而不是 `imageId`：节点级重试
+                                      // （不带 imageId）时，正是 `retryImageId` 把那个槽位置回
+                                      // 了 loading。用 `imageId` 匹配不上，失败时那个槽位永远
+                                      // 停在 loading —— 一张图永久转圈。
+                                      images: item.metadata?.images?.map((image) => (image.id === retryImageId ? { ...image, status: NODE_STATUS_ERROR, errorDetails } : image)),
                                   },
                               }
                             : item,
