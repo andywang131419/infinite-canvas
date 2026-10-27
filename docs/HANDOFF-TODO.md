@@ -224,9 +224,33 @@ Pop-Location
 
 ## 7. 进度
 
+> 2026-10-27 核对：本章节此前停在 T04-B 之前（HEAD 还写着 `486557e`），已过期。
+> 真实状态见下方「当前真实状态」。
+
 - 2026-10-26 15:50　建立本文档。HEAD=`486557e`。两条 SSRF 已修（`eeeb882`）。
-  待办：T04-A 27 个未提交文件、P1-R2-1、P1-R2-4、P1-R2-5、P2 七条。
-- 2026-10-26 16:4x　环境修复完成：bun 1.4.4 装到 `C:\Users\Administrator\.workbuddy\binaries\bun\bun-windows-x64\`，
-  `bun install` 重装 web 依赖 533 包成功 → **前端 typecheck 现在可以跑了**。
-  随即暴露 web 侧 15 处真实类型错误。**server 侧全部完成并通过验收。**
-  当前待办：web 侧 15 处类型错误（工程师修复中）→ 之后进 T04-B。
+- 2026-10-26　T04-A（前端接线）收口、web 15 处真实类型错误修复、T04-B（生成队列接管 + 刷新可恢复）完整闭环，含 P0/P1/P2 多轮修复。
+- 2026-10-26　git 网络打通（PAT + ghfast.top 镜像 + `pushnp/pullnp/fetchp` 别名），`stable` 推到 `origin/stable`。
+
+### 当前真实状态（2026-10-27 体检后）
+
+- **HEAD=`3787bdf`**，分支 `stable`，工作区干净，无未推送提交。
+- **T01 → T04-B 全部完成并推送**。
+- **自动化验证全绿**：
+  - web `bun test`：**49 通过 / 0 失败**
+  - server 类型检查（`tsc --noEmit`）：**0 错误**（server 无单测套件，验证靠下方三套脚本）
+  - web 类型检查（用 server 完整版 tsc 跑，绕过本机缺 lib 的环境坑）：**仅 1 处** `model-script-editor.tsx:58` 的 antd 6 `Modal styles.content` 类型不兼容 —— **基线问题，文件从未被改动，非本项目引入**
+  - web `vite build`：**成功**（`✓ built in ~23s`，dist 产物齐全；2 个动态/静态混合导入 warning、1 个 chunk 体积 warning，均不影响正确性）
+  - 回归脚本：verify-t02（66 项）、verify-t03（92 项）、verify-fix-p01（27 项）**全部 EXIT=0**
+- **代码审查结论**：`job-utils.ts` 纯逻辑（幂等键 / 写回落点 / 批量配对 / 视频比例）已单测覆盖且逻辑自洽；`project.tsx` 恢复链路（`resetInterruptedGeneration` → `attachOpenJobs` → 写回、`stopGenerationByRunningId` → `cancelJob`）接线完整；被删 `audio.ts` **无悬挂引用**；T04-B 三处 QA 结论落地。
+- **已知未修项**（全部见 `docs/KNOWN-ISSUES.md`，均为单用户部署下不可触发的安全加固 / 构建可复现性 / 功能缺口，非功能 bug）：
+  - 放开注册前必须修：#1 跨用户去重、#3 canvasId 归属校验、#8 sessions 索引等
+  - #11 视频「参考视频/音频」参数未透传（功能缺口，非崩溃）
+  - #2 缺 `server/bun.lock`（需 bun 环境生成）
+  - antd 6 `Modal styles.content` 基线类型错误（#12）
+
+### 当前待办（下一轮）
+
+1. **T05 真机 VPS 部署验证**：`docs/DEPLOY-VPS.md` 已写，未在真机跑过 —— 把代码变成可用服务的最后一公里。
+2. 两条 T04-B 的 P2（已标 deferred，非阻断）：`runningNodeId` 单值全局；`createdAt` 并列退化数组顺序。
+3. 桌面 108 个临时文件清理（AI 探针遗留，用户确认后收尾）。
+4. 这条「进度」章节此前严重过期，本次已刷新。
