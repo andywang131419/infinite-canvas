@@ -31,7 +31,7 @@
 1. **数据会不会丢**：架构上不会 —— `server` 和 `backup` 两个容器都挂了同一个命名卷 `data:/data`，数据库 `/data/app.db` 和媒体 `/data/media` 都落在这个卷上，删除容器、重建容器、`docker compose down` 都**不会**删掉它。（本次审查专门查了"卷挂载缺失"，**没有发现**这类问题。）
 2. **但是**：备份默认只写在**这台 VPS 自己的磁盘**上。VPS 被删、被黑、机房故障 = 数据全没。**必须配置 rclone 远端（第 6.4 节）**，这是本项目的生命线。
 3. **备份不等于能恢复**。第 6.6 节有一次完整的恢复演练步骤，**上线第一周内必须真做一次**。没演练过的备份等于没有。
-4. 本次审查发现了 **3 个会让"备份静默失效"的真实配置错误**（`deploy/docker-compose.yml:179`、`deploy/backup/entrypoint.sh:11`、`entrypoint.sh:18` 造成的目录属主问题），详见[附录 A](#附录-a本次对-deploy-配置的审查发现问题清单)。在修好之前，请严格按第 6 节的**手动补救命令**操作。
+4. 本次源码审查原发现 **3 个会让"备份静默失效"的配置错误**（F2 布尔词表不统一、F3 备份目录属主、F5 首份备份延迟），**已在代码层面修复**（详见附录 A 的 ✅ 标记）：`entrypoint.sh` 现共用 `is_truthy` 词表、启动即把 `/data/backups` 自动 chown 到 uid 1000、并注入 `BACKUP_ON_START`。仅剩 **F4**（全新部署 `/data/media` 缺失会让首夜备份记 `failed`）值得按第 4.4 节预建目录规避；F6/F7/F8 为可观测性与成本项，随版本迭代。
 5. 文档里所有 shell 脚本部分（backup.sh / entrypoint.sh）是**源码级审查**结论，写文档的本机是 Windows，没有 bash/sqlite3/gzip/rclone，**没有真跑过**。所以每一步都给了"验收命令"，请你按验收结果为准。
 
 ---
@@ -275,11 +275,11 @@ $ grep -c '=$' .env
 | `APP_DOMAIN` | 🟥 | 你的真实域名，如 `canvas.example.com` | 留空 = `localhost` → Caddy 只为 localhost 签发、公网访问直接失败；且配了邮箱也签不到证 |
 | `TLS_MODE` | 🟥 | 你的邮箱，如 `dige@example.com` | 留空 = `internal` 自签证书 → 每次打开都是红色安全警告，且**配了 `APP_DOMAIN` 真实域名也签不到 Let's Encrypt 证书** |
 | `RESULT_DOWNLOAD_ALLOWLIST` | 🟥 | 结果文件所在域名，逗号分隔（见 3.3） | 留空 = **拒绝一切结果下载** → 现象是"AI 说生成成功了，画布上永远没有图"。这是 fail-closed 的安全设计，不是 bug |
-| `BACKUP_ENABLED` | 🟧 | **只能写 `true`** | 🔴 写 `1` / `yes` / `on` / `True` → `entrypoint.sh:11` 只认精确的 `"true"`，会被判为"关闭备份" → **容器空转、一条备份都不做，而且没有任何报错**（详见附录 A F2）。在修复前请**写死 `true`** |
+| `BACKUP_ENABLED` | 🟢 | `true` / `1` / `yes` / `on` 均为真（其余含空串为假） | 布尔词表已在 `server/src/env.ts` 的 `boolFromEnv`、`backup.sh` 与 `entrypoint.sh` 的 `is_truthy` 三处统一（附录 A F2 **已修**）。写 `1/yes/on` 现在都能正确开启备份，无需写死 `true` |
 | `BACKUP_INCLUDE_MEDIA` | 🟧 | `true` | 写 `false`/`0`/`no`/`off` → 只备份数据库，媒体零备份 → **恢复后画布里所有图 404**。另外不能写 `maybe` 这类无法判定的值，否则 server 启动崩溃 |
 | `RCLONE_REMOTE` + `RCLONE_DEST` | 🟧 | 远端名与目标路径，如 `mycos` / `ic-backup/2026` | 留空 = **只有 VPS 本地一份备份**。VPS 一毁全没。这是本项目最该补的一项 |
 | `RCLONE_CONFIG_FILE` | 🟩 | **留空**（compose 已透传；留空 = 默认 `/root/.config/rclone/rclone.conf`） | 只有把 `rclone.conf` 放到别处才需要填（改法见 6.4）。注意别设 `RCLONE_CONFIG`（单数）—— `backup.sh` 用 `--config` 显式传路径，flag 优先级高于环境变量，设了不生效 |
-| `BACKUP_ON_START` | 🟧 | —— | 🔴 **这个变量现在写了也没用**：只有 `entrypoint.sh:33` 读它，但 compose 和 `.env.example` 都没声明它 → 永远取默认 `false` → **首份备份要等到第二天凌晨 3 点**。首次上线请按 6.2 手动跑一次 |
+| `BACKUP_ON_START` | 🟢 | 默认 `true` | 已接进 `docker-compose.yml`（`backup.environment` 注入 `${BACKUP_ON_START:-true}`）与 `.env.example`，`entrypoint.sh` 启动即先跑一次（附录 A F5 **已修**）。新机器首日即有首份备份，无需手动跑；设 `false` 则等到首次 cron（默认次日 03:00） |
 | `DATABASE_PATH` | 🟩 | **保持 `/data/app.db`** | 改了就必须同步改 backup 服务的 `DATABASE_PATH`，否则备份打的是空库 |
 | `STORAGE_LOCAL_ROOT` | 🟩 | **保持 `/data/media`** | 改了必须同步改 backup 服务的 `STORAGE_LOCAL_ROOT`，否则 `backup.sh` 找不到目录 → 记 failed 并退出 |
 | `COOKIE_SECURE` | 🟩 | `true` | 全站 HTTPS，必须为 true；设 false 会让会话 Cookie 走明文 |
@@ -382,23 +382,18 @@ $ curl -k https://127.0.0.1/api/health
 #   - worker 是 "disabled" → WORKER_ENABLED 被设成了假值，生图任务不会跑
 ```
 
-### 4.4 首次部署后立刻要做的两件补救（重要）
+### 4.4 首次部署后建议做的一件预防（可选，F4 缓解）
 
-这两件是因为附录 A 里的 **F4 / F5** 尚未修复，不做会有后果：
+**F5 已修**：`BACKUP_ON_START` 默认 `true`，容器启动即先备份一次，不必再手动跑。只剩 **F4** 值得顺手预防：全新部署时 `/data/media` 还不存在，当晚定时备份会因为这目录缺失而记 `failed`（不是数据丢失，但会让你误以为备份坏了）。预建它即可：
 
 ```bash
-# (1) 建出 /data/media 目录（否则今晚 3 点的备份会因为"媒体目录不存在"直接判失败）
+# (1) 建出 /data/media 目录（否则当晚定时备份会因为"媒体目录不存在"直接判 failed）
 $ docker exec ic-server mkdir -p /data/media
 $ docker exec ic-server ls -ld /data/media
 # 预期：drwxr-xr-x … bun  bun  /data/media   （属主是 bun，不是 root）
-
-# (2) 修正备份目录属主，否则设置页的"立即备份"按钮会失败
-$ docker exec ic-server id
-# 预期：uid=1000(bun) gid=1000(bun)   ← 记下这个 uid:gid
-$ docker exec ic-backup sh -c 'mkdir -p /data/backups && chown -R 1000:1000 /data/backups'
-$ docker exec ic-backup ls -ld /data/backups
-# 预期：drwxr-xr-x … 1000  1000  /data/backups
 ```
+
+> 说明：设置页「立即备份」所需的 `/data/backups` 属主，现在由 `entrypoint.sh` 启动时自动 chown 到 uid 1000（F3 已修），**不要再手动 chown**；原 4.4 第 (2) 步已删除。
 
 ### 4.5 建第一个账号
 
@@ -589,9 +584,9 @@ $ docker exec ic-backup sh -c 'f=$(ls -t /data/backups/media-*.tar.gz | head -n1
 # 预期：列出 media/2026/… 这样的路径，总数 > 0
 ```
 
-### 6.3 现在就手动跑一次（别等凌晨 3 点）
+### 6.3 立即手动跑一次（可选，F5 已修后通常不必）
 
-因为 `BACKUP_ON_START` 目前没接进去（附录 A F5），**首份备份要等到次日 03:00**。上线当天请手动跑一次：
+（附录 A F5 **已修**：`BACKUP_ON_START` 默认 `true`，容器启动即先备份一次，通常不必手动跑。以下命令仅在你想立刻强制再跑一次、或已把 `BACKUP_ON_START` 设为 `false` 时有用）：
 
 ```bash
 $ docker exec ic-backup /usr/local/bin/backup.sh
@@ -917,16 +912,16 @@ $ cd deploy && docker compose up -d --build
 
 ## 9. 已知风险与待办（上线后如何自查）
 
-### 9.1 本次审查新发现（**未修，靠运维规避**）
+### 9.1 本次审查新发现（**多数已修，少数靠运维规避**）
 
 详细内容与修法见[附录 A](#附录-a本次对-deploy-配置的审查发现问题清单)。这里只给"上线后怎么自查有没有踩坑"：
 
 | 风险 | 自查方法 | 看到什么 = 踩坑了 |
 | --- | --- | --- |
-| 🔴 异地备份实际没生效 | ①`docker exec ic-backup rclone config file` ②设置页备份历史 / 第 8 节第 4 条的审计行 | ①输出不是 `/root/.config/rclone/rclone.conf` ②审计行里出现 `rclone config missing` 或 `rclone upload failed` |
-| 🔴 `BACKUP_ENABLED` 写成 `1/yes/on` → 备份被静默关闭 | `grep '^BACKUP_ENABLED' /srv/ic/deploy/.env` + 第 8 节第 4 条 | 值不是 `true`，且 `backups` 表连续 7 天没有任何新行 |
-| 🔴 设置页「立即备份」按钮失败 | 点一下看返回；或 `docker compose logs server \| grep -i backup` | 报 `BACKUP_FAILED`（第 4.4 节的 chown 没做） |
-| 🟡 首份备份要等到次日 03:00 | 上线当天 `ls /data/backups` | 上线当天目录是空的（按 6.3 手动跑一次） |
+| ✅ 异地备份配置验证 | ①`docker exec ic-backup rclone config file` ②设置页备份历史 / 第 8 节第 4 条的审计行 | ①应输出 `/root/.config/rclone/rclone.conf` ②审计行不应出现 `rclone config missing` / `rclone upload failed`（F1 已修，正常即绿） |
+| ✅ `BACKUP_ENABLED` 布尔词表统一 | `grep '^BACKUP_ENABLED' /srv/ic/deploy/.env` + 第 8 节第 4 条 | 值应为 `true/1/yes/on` 之一；`backups` 表应持续有新行（F2 已修，写 `1/yes/on` 也能正常开备份） |
+| ✅ 设置页「立即备份」按钮 | 点一下看返回；或 `docker compose logs server \| grep -i backup` | 应成功；若报 `BACKUP_FAILED`，多半是 `/data/backups` 属主异常（F3 已修，entrypoint 启动自动 chown 到 uid 1000，正常即绿） |
+| ✅ 首份备份（启动即做） | 上线后 `ls /data/backups` | 应立刻出现首份备份（F5 已修，`BACKUP_ON_START=true`）；设 `false` 才等到 cron |
 | 🟡 备份容器僵死但 `docker ps` 显示 Up | 第 8 节第 4 条（审计行） | 连续两天没有新审计行，但容器显示 Up |
 | 🟡 远端只增不删 | 去对象存储控制台看容量 | 容量单调上升 → 配生命周期规则 |
 
@@ -938,7 +933,7 @@ $ cd deploy && docker compose up -d --build
 | `RESULT_DOWNLOAD_ALLOWLIST` 空白 = 功能全阻断 | `deploy/.env` / `server/src/env.ts:124` | 「AI 生成成功但画布上没图」。compose 已经注入了这个变量（第 129 行），**缺的是值** | 跑一次生图 → `docker compose logs server \| grep -i '不允许的结果下载地址'` → 把域名填进去 |
 | 备份容器以 root 对生产库写审计行 | `deploy/backup/backup.sh` | 极端情况下 `-wal`/`-shm` 被 root 重建 → 服务端（bun）写不了库 | 第 8 节第 9 条每月查一次属主；发现 root 属主就 chown 回 1000 |
 | HSTS 对 localhost 自签场景 | `deploy/Caddyfile:46` | 只在 localhost 自签调试时，浏览器会长期强制 https | 纯 localhost 调试时把第 46 行注释掉 |
-| `server/` 没有 lockfile，镜像构建不可复现 | `server/Dockerfile` | 同一 commit 两次构建可能装到不同依赖版本 | 升级时留意 `docker compose logs server` 的启动日志；有条件时补 `bun.lock` |
+| `server/` 镜像构建已可复现 | `server/Dockerfile` + `server/bun.lock`（T05 生成） | `bun install --frozen-lockfile --production` 锁定版本，同一 commit 两次构建装同一依赖 | 升级依赖后重跑 `bun install` 并提交新 `bun.lock` |
 
 ---
 
@@ -953,17 +948,17 @@ $ cd deploy && docker compose up -d --build
 - ✅ **没有发现端口前后不一致**：`web` 内 3000（nginx.conf:2 / compose:62）、`server` 内 8787（compose:79,133 / Caddyfile:56），三处一致。
 - ✅ **cron 的退出码没有被管道吞掉**：`deploy/backup/crontab:7` 用的是 `>> /proc/1/fd/1 2>&1`（重定向，不是 `| tee` 之类），退出码保留。真正的问题是**失败了没人知道**（见 F6）。
 - 🟢 **F1（rclone 配置读不到）已修**（commit `ee47e8c`）：挂载点改为 `/root/.config/rclone` + `backup.sh` 显式 `--config`；并且缺少配置时从「静默只留本地」改成**记 failed 审计行并 exit 1**。上线后按第 6.4 节验证一次即可。
-- 🔴 **仍未修的是 F2 / F3**（两者都会让备份失效，**F2 还完全不报错**），上线前必须做完两件小事：
-  `.env` 里 `BACKUP_ENABLED` **只能写 `true`**（写 `1`/`yes`/`on` 会被判成关闭，见 F2）；
-  启动后执行 `docker exec ic-backup sh -c 'chown -R 1000:1000 /data/backups'`（否则设置页「立即备份」必然失败，见 F3）。
+- 🟢 **F2（备份被静默关闭）已修**：`entrypoint.sh` 与 `backup.sh` 现共用同一套 `is_truthy`（认 `true/1/yes/on`，与 `env.ts` 的 `boolFromEnv` 一致），`.env.example` 已写明词表。写 `1/yes/on` 也能正常开备份，无需写死 `true`。
+- 🟢 **F3（设置页「立即备份」失败）已修**：`entrypoint.sh` 启动时会自动把 `$BACKUP_STAGE_DIR`（默认 `/data/backups`）chown 到 uid 1000（非致命，失败仅告警）。**不再需要在宿主机手动 chown**。
+- 🟢 **F5（首份备份要等次日）已修**：`docker-compose.yml` 的 `backup.environment` 已注入 `BACKUP_ON_START: ${BACKUP_ON_START:-true}`，`.env.example` 已设默认 `true`，`entrypoint.sh` 启动即先跑一次。新机器首日即有首份备份。
 
 | # | 位置 | 后果（一句话） | 怎么改 |
 | --- | --- | --- | --- |
 | **F1** ✅ **已修**（commit `ee47e8c`） | 原 `deploy/docker-compose.yml`（`- ./rclone:/config/rclone:ro`） | 容器里是 **alpine 版 rclone**，默认去读 `/root/.config/rclone/rclone.conf`，**不会**自动读挂载进来的 `/config/rclone/rclone.conf` → 一旦配了 `RCLONE_REMOTE`，异地备份完全不生效 | 挂载点改为 `./rclone:/root/.config/rclone:ro`（compose、`Dockerfile` 的 `mkdir`、`backup.sh` 的 `--config` 三处已对齐）；同时 `RCLONE_REMOTE` 非空却找不到配置时改为**记 failed 审计行并 `exit 1`**，不再是静默失效。**上线后仅需验证**：`docker exec ic-backup rclone config file` 输出 `/root/.config/rclone/rclone.conf` |
-| **F2** 🔴 | `deploy/backup/entrypoint.sh:11`（`if [ "${BACKUP_ENABLED:-true}" != "true" ]`） | 提交 `997435f` 统一了 `env.ts` 与 `backup.sh` 的布尔口径（认 `true/1/yes/on`），但 **entrypoint 没跟着改**，仍只认精确的 `"true"` → 把 `BACKUP_ENABLED` 写成 `1`/`yes`/`on`/`True` 会被判为"关闭" → 容器进入空转、**一条备份都不做，且无任何报错**（第 33 行的 `BACKUP_ON_START` 同理） | entrypoint 里复用与 `backup.sh` 相同的 `is_truthy` 判定。**在此之前：`.env` 里的 `BACKUP_ENABLED` 必须写死 `true`** |
-| **F3** 🔴 | `deploy/backup/entrypoint.sh:18`（`mkdir -p /etc/crontabs /data/backups`，以 root 执行） | `/data/backups` 被建成 **root:root 755**，而 server 容器里进程是 `bun`（uid 1000）→ 设置页的「立即备份」（`POST /api/backups/run`，要往 `/data/backups` 写文件）**必然失败**，返回 `BACKUP_FAILED`。cron 备份不受影响（它自己就是 root） | 启动后执行一次 `docker exec ic-backup sh -c 'chown -R 1000:1000 /data/backups'`（第 4.4 节第 2 步）。彻底修法：让备份容器以 uid 1000 运行并写审计行（但 busybox crond 需要 root，需连 `KNOWN-ISSUES` 第 6 条一起设计） |
+| **F2** ✅ **已修** | 原 `entrypoint.sh` 只认精确 `"true"`；现 `entrypoint.sh:22-29` 与 `backup.sh` 共用 `is_truthy`（认 `true/1/yes/on`），并与 `env.ts` 的 `boolFromEnv` 词表一致 | 写 `1/yes/on` 现在都能正确开启备份，不再静默关闭（`.env.example` 已注明词表） | 无需额外操作；上线后按第 6.4 节验证一次即可 |
+| **F3** ✅ **已修** | 原 `/data/backups` 建成 root:root 755，server（uid 1000）无法写入 → 「立即备份」必失败 | 现 `entrypoint.sh:57-64` 启动即把 `$BACKUP_STAGE_DIR` chown 到 uid 1000（非致命，失败仅告警），无需手动 chown | 无需额外操作 |
 | **F4** 🟡 | `deploy/backup/backup.sh:198`（媒体目录不存在即判失败） | 全新部署时 `/data/media` **不存在**（server 只在第一次落盘资产时才 `mkdir`，见 `storage/local-disk.ts:66`）→ 上线第一晚若还没传过任何图，备份会记 `failed` 并 `exit 1`。不是数据丢失，但会让人误以为"备份坏了" | 首次启动后执行一次 `docker exec ic-server mkdir -p /data/media`（以 bun 身份建，属主正确）。或在 `server` 启动时预建该目录 |
-| **F5** 🟡 | `deploy/backup/entrypoint.sh:33` 读 `BACKUP_ON_START`，但 `docker-compose.yml` 与 `.env.example` **都没声明**它 | 该开关永远取默认 `false` → "容器启动即先备份一次"这段代码**永远不执行** → 首份备份要等到次日 03:00 | compose 的 `backup.environment` 加 `BACKUP_ON_START: ${BACKUP_ON_START:-true}`，`.env.example` 补一行。临时办法：按 6.3 手动跑一次 |
+| **F5** ✅ **已修** | 原 `BACKUP_ON_START` 未接进 compose / `.env.example`，永远取默认 `false` → 首份备份要等次日 | 现 `docker-compose.yml:174` 注入 `${BACKUP_ON_START:-true}`，`.env.example:100` 默认 `true`，`entrypoint.sh:80` 启动即先跑一次 | 无需额外操作 |
 | **F6** 🟡 | `deploy/docker-compose.yml:152-184`（backup 服务无 healthcheck） | crond 挂了 / 容器僵死时，`docker compose ps` 仍然显示 `Up`，**没有任何告警** → 备份停了可能几周才发现 | 加一个 `healthcheck`（例如探测 `crond` 进程或"最近 24h 内有新审计行"）。在此之前：按第 8 节第 4 条每周查审计行 |
 | **F7** 🟡 | `deploy/backup/backup.sh:245`（只有 `rclone copy`） | 远端**从不删除**旧备份 → 对象存储容量与成本单调增长 | 在对象存储侧配生命周期规则（如 60 天后删除/转低频） |
 | **F8** 🟢 | `deploy/docker-compose.yml:50-64`（web 服务无 healthcheck） | nginx 挂了 Caddy 仍会转发 → 502，且 `depends_on` 只等 `service_started` | 给 web 加一个 `healthcheck`（`curl -f http://127.0.0.1:3000/`）；nginx:alpine 自带 wget，可用 `wget -qO-` |
@@ -971,10 +966,11 @@ $ cd deploy && docker compose up -d --build
 ### 修复优先级建议
 
 1. ~~**F1**（异地备份实际不生效）~~ ✅ **已修（`ee47e8c`）**：升级后按第 6.4 节验证一次 `rclone config file` 即可。
-2. **F2**（备份被静默关闭）—— **现在是最高优先级**，因为它不报错。
-3. **F3**（手动备份按钮失败）—— 影响你对"备份能用"的信心。
-4. F5 / F4 —— 影响首日体验，有手动规避办法。
-5. F6 / F7 / F8 —— 可观测性与成本，随版本迭代处理。
+2. ~~**F2**（备份被静默关闭）~~ ✅ **已修**：`is_truthy` 词表统一，写 `1/yes/on` 也能开备份。
+3. ~~**F3**（手动备份按钮失败）~~ ✅ **已修**：entrypoint 启动自动 chown 到 uid 1000。
+4. ~~**F5**（首份备份等次日）~~ ✅ **已修**：`BACKUP_ON_START` 默认 true，启动即备份。
+5. **F4**（全新部署 `/data/media` 不存在 → 当晚备份记 `failed`）—— 仅首夜 cosmetic，按 4.4 节预建目录即可规避。
+6. F6 / F7 / F8 —— 可观测性与成本，随版本迭代处理。
 
 ---
 

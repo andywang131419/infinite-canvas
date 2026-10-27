@@ -44,22 +44,17 @@
 
 ---
 
-## 2. P1-4 `server/` 没有 lockfile，镜像构建不可复现
+## 2. P1-4 `server/` 镜像构建不可复现 —— ✅ **T05 已修**
 
-**位置**：`server/Dockerfile`（`RUN bun install --production`）
-**现象**：仓库里不存在 `server/bun.lock`，`hono@^4.6.14` / `zod@^3.24.1` 按 `^` 浮动解析。
+**位置**：`server/Dockerfile`（`RUN bun install --frozen-lockfile --production`）
+**现象（修复前）**：仓库里不存在 `server/bun.lock`，`hono@^4.6.14` / `zod@^3.24.1` 按 `^` 浮动解析。
 同一 commit 两次构建可能装到不同版本，也无法审计供应链。
 
-**为什么本轮不修**：本机无 bun（无 `bun install` 能力），生成 lockfile 必须在有 bun 的环境做。
+**T05 修复（2026-10-26）**：在本地 bun 环境执行 `cd server && bun install`，生成并提交 `server/bun.lock`（26 个依赖，1562 字节），
+`Dockerfile` 改为 `COPY package.json bun.lock ./` + `RUN bun install --frozen-lockfile --production`。
+现在同一 commit 两次构建装同一依赖，供应链可审计。
 
-**将来修**：
-```bash
-# 任一有 bun 的环境（或 oven/bun 容器）里执行
-cd server && bun install          # 生成 bun.lock
-git add bun.lock
-# 然后把 Dockerfile 改成：
-RUN bun install --frozen-lockfile --production
-```
+**维护**：以后升级 `server` 依赖后，重跑 `bun install` 并提交新的 `server/bun.lock` 即可。
 
 ---
 

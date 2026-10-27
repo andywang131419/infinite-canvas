@@ -16,12 +16,10 @@ ENV NODE_ENV=production \
     DATABASE_PATH=/data/app.db \
     MIGRATIONS_DIR=migrations
 
-# 先只拷 manifest 装依赖，最大化层缓存命中。
-COPY package.json ./
-# 注意：T01 阶段尚无 bun.lock（本机无 bun 可用于生成）。
-#      一旦在 T02 生成并提交 server/bun.lock，应改为：
-#      RUN bun install --frozen-lockfile --production
-RUN bun install --production
+# 先只拷 manifest + lockfile 装依赖，最大化层缓存命中。
+COPY package.json bun.lock ./
+# 已生成并提交 server/bun.lock（T05），用 --frozen-lockfile 锁定版本，构建可复现。
+RUN bun install --frozen-lockfile --production
 
 COPY tsconfig.json ./
 COPY src ./src

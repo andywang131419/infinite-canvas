@@ -215,8 +215,7 @@ Pop-Location
 - **P1-2 跨用户去重**：`ux_assets_sha256_driver` 是全局唯一（无 `owner_id`），单用户不可触发。
   但这是**放开注册前的阻断项** —— 届时唯一索引要改 `(sha256, storage_driver, owner_id)`，
   注意「DB 唯一性按 owner」和「物理文件回收按全局 sha」是两件事，要分开设计
-- **P1-4** 缺 `server/bun.lock`，镜像构建不可复现（本机无 bun）。生成方法：用 `oven/bun` 容器跑一次
-  `bun install` 提交 lock，再把 Dockerfile 改成 `--frozen-lockfile`
+- ~~**P1-4** 缺 `server/bun.lock`~~ ✅ **T05 已修**：本地 bun 跑 `bun install` 生成并提交 `server/bun.lock`，Dockerfile 改 `COPY package.json bun.lock ./` + `RUN bun install --frozen-lockfile --production`（详见 `docs/KNOWN-ISSUES.md` #2）。
 - DNS rebinding TOCTOU：`resolveAndCheckHost` 查一次、`fetch` 自己再解析一次，未绑定。
   彻底修法是校验与连接共用同一份解析结果（把解析出的 IP 传给 fetch 的 `lookup`）
 
@@ -245,12 +244,14 @@ Pop-Location
 - **已知未修项**（全部见 `docs/KNOWN-ISSUES.md`，均为单用户部署下不可触发的安全加固 / 构建可复现性 / 功能缺口，非功能 bug）：
   - 放开注册前必须修：#1 跨用户去重、#3 canvasId 归属校验、#8 sessions 索引等
   - #11 视频「参考视频/音频」参数未透传（功能缺口，非崩溃）
-  - #2 缺 `server/bun.lock`（需 bun 环境生成）
+  - ~~#2 缺 `server/bun.lock`~~ ✅ **T05 已生成并提交**（本地 bun 跑 `bun install`，Dockerfile 改 `--frozen-lockfile`），镜像构建可复现。
   - antd 6 `Modal styles.content` 基线类型错误（#12）
 
 ### 当前待办（下一轮）
 
-1. **T05 真机 VPS 部署验证**：`docs/DEPLOY-VPS.md` 已写，未在真机跑过 —— 把代码变成可用服务的最后一公里。
+1. **T05 真机 VPS 部署验证**（进行中）：
+   - ✅ 本机静态预检 + 加固已完成：`server/bun.lock` 生成并提交、根 `Dockerfile` 的 `COPY` 引用文件全部存在、`DEPLOY-VPS.md` 中 F2/F3/F5 的陈旧 🔴「未修」结论已翻正为 ✅（代码本就修好，手册曾严重过期）、`KNOWN-ISSUES #2` 关闭。
+   - ⏳ 剩余：在真实 VPS 上按 `docs/T05-VERIFY.md` 跑「构建 → 健康检查 → 初始化 → 备份验证 → 恢复演练 → 功能回归」六阶段（本机无 Docker / VPS 凭证，无法代跑，需 owner 在 VPS 执行）。
 2. 两条 T04-B 的 P2（已标 deferred，非阻断）：`runningNodeId` 单值全局；`createdAt` 并列退化数组顺序。
 3. 桌面 108 个临时文件清理（AI 探针遗留，用户确认后收尾）。
 4. 这条「进度」章节此前严重过期，本次已刷新。
