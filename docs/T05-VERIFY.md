@@ -21,10 +21,12 @@
 
 ## 阶段 1：构建（VPS）
 
+> ⚠️ **部署入口唯一正确位置是 `deploy/` 目录。** 仓库根目录的 `docker-compose.yml`（拉上游预构建 `ghcr.io/basketikun/infinite-canvas:latest`）和 `docker-compose.local.yml`（构建根 `Dockerfile`）**都只跑 `app`、不含 `server` 服务**——从根目录跑 `docker compose up` 起得来，但跨设备同步完全不工作。下面所有 `docker compose` 命令都必须在 `deploy/` 内执行。
+
 ```bash
 cd /srv/ic
 git pull                                  # 拉到含 server/bun.lock 的版本
-cd deploy
+cd deploy                                 # ← 必须在 deploy/ 里，否则用的不是 4 服务栈
 docker compose build --no-cache
 ```
 
